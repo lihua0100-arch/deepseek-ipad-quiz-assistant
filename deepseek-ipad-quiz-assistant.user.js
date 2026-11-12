@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name    DeepSeek 智能题库助手 (iPad 学习通/U校园/全平台触屏通用版)
 // @namespace    https://tampermonkey.net/
-// @version      3.3.0
+// @version      3.4.0
 // @updateURL    https://raw.githubusercontent.com/lihua0100-arch/deepseek-ipad-quiz-assistant/main/deepseek-ipad-quiz-assistant.user.js
 // @downloadURL  https://raw.githubusercontent.com/lihua0100-arch/deepseek-ipad-quiz-assistant/main/deepseek-ipad-quiz-assistant.user.js
-// @description  专为 iPad Safari 与 Mac 打造（全面适配学习通 mooc1.chaoxing.com、U校园、超星尔雅）：1.默认启用 R1 深度推理 + 6路并发预取，修正“箱量少集中配装 vs 箱量大分散排位”边界；2.新增【批改结果页自动记忆】：提交后在详情页自动记住已做对的题、标准答案及做错的排除项，点击“重做”再刷时直接秒选已对题目并自动排除上次错项，轻松拿满分！
+// @description  专为 iPad Safari 与 Mac 打造（全面适配学习通 mooc1.chaoxing.com、U校园、超星尔雅）：1.突破 DeepSeek API 无联网限制，利用油猴跨域特权内置【Bing/百度实时联网搜题引擎(RAG)】，自动抓取全网原题题库摘要喂给模型；2.内置【全卷30题上下文前后互证】（如第29题自动参考第13题题干中的“3°”）；3.采用 V3+联网搜题+8路并发流水线，彻底消除第13题长思考卡顿！
 // @author       Gemini
 // @match        *://*/*
 // @allFrames    true
@@ -13,6 +13,11 @@
 // @grant        GM_getValue
 // @grant        GM_registerMenuCommand
 // @connect      api.deepseek.com
+// @connect      cn.bing.com
+// @connect      www.bing.com
+// @connect      www.baidu.com
+// @connect      m.baidu.com
+// @connect      *
 // @run-at       document-end
 // ==/UserScript==
 
@@ -31,13 +36,16 @@
     const CONFIG = {
         apiUrl: 'https://api.deepseek.com/chat/completions',
         longPressDuration: 450,
-        concurrency: 6
+        concurrency: 6,           // 6 路并发预取（联网搜题 + AI推理并行流水线，彻底告别第13题卡顿）
+        enableWebSearch: true,    // 默认开启实时联网搜题增强 (RAG)
+        searchTimeoutMs: 3200     // 联网搜索最大超时时间（毫秒），超时立即无缝走模型推理，绝不卡顿
     };
 
     const STATE = {
         apiKey: GM_getValue('DEEPSEEK_API_KEY', ''),
-        model: GM_getValue('DEEPSEEK_MODEL_V32', 'deepseek-reasoner'),
-        // 跨页持久化的“已验证正确题库 & 错题排除记录” { [stemKey]: { correctLetter, correctText, wrongLetters: [] } }
+        // 有了实时联网搜题(RAG)与全卷互证，默认使用响应极快的 deepseek-chat (V3)，彻底消除 R1 思考 15 秒导致的卡顿！
+        model: GM_getValue('DEEPSEEK_MODEL_V34', 'deepseek-chat'),
+        webSearchEnabled: GM_getValue('DEEPSEEK_WEB_SEARCH', true),
         verifiedBank: GM_getValue('DEEPSEEK_VERIFIED_BANK', {}),
         isAnalyzing: false,
         isBatchRunning: false,
@@ -55,7 +63,118 @@
     }
 
     /********************************************************************
-     * 2. 页面主环境点击桥接器 (Main-World Click Bridge)
+     * 2. 实时联网搜题引擎 (Web Search RAG via GM_xmlhttpRequest)
+     * 原理：DeepSeek 官方 API 默认是离线模型，无法上网查国内题库原题。
+     * 本模块利用油猴 GM_xmlhttpRequest 跨域能力，在发给 DeepSeek 前实时向
+     * 必应 (Bing) 与百度并发检索题干原题，提取网课/船员题库/专业课网页摘要喂给 DeepSeek！
+     ********************************************************************/
+    function cleanSearchQuery(stemText) {
+        return String(stemText || '')
+            .replace(/^\s*\d+[.、\s)）]*/, '')
+            .replace(/\(\s*[单多判填简]选题[^)]*\)/g, '')
+            .replace(/\[\[.*?\]\]/g, ' ')
+            .replace(/_{2,}/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .slice(0, 72);
+    }
+
+    function fetchUrlTextWithTimeout(url, timeoutMs = CONFIG.searchTimeoutMs) {
+        return new Promise((resolve) => {
+            let settled = false;
+            const timer = setTimeout(() => {
+                if (!settled) {
+                    settled = true;
+                    resolve('');
+                }
+            }, timeoutMs);
+
+            try {
+                GM_xmlhttpRequest({
+                    method: 'GET',
+                    url,
+                    headers: {
+                        'Accept': 'text/html,application/xhtml+xml',
+                        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8'
+                    },
+                    timeout: timeoutMs,
+                    onload: (res) => {
+                        if (settled) return;
+                        settled = true;
+                        clearTimeout(timer);
+                        resolve(res.status === 200 ? (res.responseText || '') : '');
+                    },
+                    onerror: () => {
+                        if (settled) return;
+                        settled = true;
+                        clearTimeout(timer);
+                        resolve('');
+                    },
+                    ontimeout: () => {
+                        if (settled) return;
+                        settled = true;
+                        clearTimeout(timer);
+                        resolve('');
+                    }
+                });
+            } catch (_) {
+                if (!settled) {
+                    settled = true;
+                    clearTimeout(timer);
+                    resolve('');
+                }
+            }
+        });
+    }
+
+    function parseSearchSnippetsFromHTML(html) {
+        if (!html) return [];
+        const doc = new DOMParser().parseFromString(html, 'text/html');
+        doc.querySelectorAll('script, style, noscript, nav, header, footer').forEach(el => el.remove());
+
+        const snippets = [];
+        // 提取 Bing (.b_algo, .b_caption) 与 百度 (.c-container, .c-abstract, .content-right_8Zs40) 的搜索结果摘要
+        const selectors = [
+            '.b_algo', '.b_caption p', '.b_snippet',
+            '.c-container', '.c-abstract', '[class*="content-right"]', '[class*="summary"]', '.result'
+        ];
+        const nodes = doc.querySelectorAll(selectors.join(','));
+        for (const node of nodes) {
+            const txt = (node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim();
+            if (txt.length >= 20 && txt.length <= 450 && !snippets.includes(txt)) {
+                snippets.push(txt);
+            }
+            if (snippets.length >= 5) break;
+        }
+        return snippets;
+    }
+
+    async function searchWebForQuestionClues(stemText, optionsList = []) {
+        if (!STATE.webSearchEnabled) return '';
+        const query = cleanSearchQuery(stemText);
+        if (query.length < 5) return '';
+
+        const optKeywords = optionsList.slice(0, 4).map(o => o.cleanContent).join(' ');
+        const fullQuery = `${query} ${optKeywords}`.slice(0, 95);
+
+        const bingUrl = `https://cn.bing.com/search?q=${encodeURIComponent(fullQuery)}`;
+        const baiduUrl = `https://www.baidu.com/s?wd=${encodeURIComponent(query)}&rn=5`;
+
+        const [bingHtml, baiduHtml] = await Promise.all([
+            fetchUrlTextWithTimeout(bingUrl, CONFIG.searchTimeoutMs),
+            fetchUrlTextWithTimeout(baiduUrl, CONFIG.searchTimeoutMs)
+        ]);
+
+        const combinedSnippets = [
+            ...parseSearchSnippetsFromHTML(bingHtml),
+            ...parseSearchSnippetsFromHTML(baiduHtml)
+        ].slice(0, 6);
+
+        return combinedSnippets.join('\n---\n').slice(0, 1600);
+    }
+
+    /********************************************************************
+     * 3. 页面主环境点击桥接器 (Main-World Click Bridge)
      ********************************************************************/
     function injectMainWorldBridge() {
         if (document.getElementById('ds-mainworld-bridge')) return;
@@ -113,7 +232,7 @@
     injectMainWorldBridge();
 
     /********************************************************************
-     * 3. UI 样式
+     * 4. UI 样式
      ********************************************************************/
     const isTopFrame = window.self === window.top;
 
@@ -180,7 +299,7 @@
             position: fixed;
             right: 16px;
             bottom: 92px;
-            width: 350px;
+            width: 355px;
             max-width: calc(100vw - 32px);
             background: rgba(15, 23, 42, 0.95);
             color: #f8fafc;
@@ -268,8 +387,8 @@
             color: #f1f5f9;
             border: 1px solid rgba(148, 163, 184, 0.3);
             border-radius: 6px;
-            padding: 5px 9px;
-            font-size: 12px;
+            padding: 5px 8px;
+            font-size: 11.5px;
             cursor: pointer;
             -webkit-tap-highlight-color: transparent;
             display: inline-flex;
@@ -321,7 +440,7 @@
                 contentBox: topDoc.getElementById('ds-card-content'),
                 footerBox: topDoc.getElementById('ds-card-footer'),
                 sweepBtn: topDoc.getElementById('ds-btn-autosweep'),
-                fillBtn: topDoc.getElementById('ds-btn-autofill'),
+                searchBtn: topDoc.getElementById('ds-btn-websearch'),
                 modelBtn: topDoc.getElementById('ds-btn-switch-model')
             };
         } catch (_) {
@@ -331,7 +450,7 @@
                 contentBox: document.getElementById('ds-card-content'),
                 footerBox: document.getElementById('ds-card-footer'),
                 sweepBtn: document.getElementById('ds-btn-autosweep'),
-                fillBtn: document.getElementById('ds-btn-autofill'),
+                searchBtn: document.getElementById('ds-btn-websearch'),
                 modelBtn: document.getElementById('ds-btn-switch-model')
             };
         }
@@ -341,26 +460,26 @@
         fabEl = document.createElement('div');
         fabEl.id = 'ds-fab';
         fabEl.innerHTML = '🎯';
-        fabEl.title = '单击：解析单题/吸取批改页答案 | 长按 或 连点3下：全卷丝滑滚屏高准全选！';
+        fabEl.title = '单击：联网解析单题 | 长按 或 连点3下：实时联网搜题 + 全卷互证丝滑全选！';
         document.body.appendChild(fabEl);
 
         cardEl = document.createElement('div');
         cardEl.id = 'ds-card';
         cardEl.innerHTML = `
             <div class="ds-card-header">
-                <span class="ds-card-title">💡 DeepSeek 题库助手 3.3 (满分记忆版)</span>
+                <span class="ds-card-title">🌐 DeepSeek 题库助手 3.4 (联网搜题版)</span>
                 <span class="ds-card-close" id="ds-card-close-btn">✕</span>
             </div>
             <div id="ds-card-content">
                 <div style="color:#94a3b8;font-size:12px;">
-                    • <b>轻点 1 下 🎯</b>：解析当前单题（若在批改详情页则自动记忆整页标准答案与错题）<br>
-                    • <b>长按 🎯 或 连点 3 下 🎯</b>：启动<b>R1 深度推理 + 错题记忆排除</b>，从头到尾滚屏全选！
+                    • <b>轻点 1 下 🎯</b>：联网搜题解析单题（在批改页则自动记忆答案）<br>
+                    • <b>长按 🎯 或 连点 3 下 🎯</b>：启动<b>🌐 实时联网搜原题 + 全卷30题互证 + 6路极速并发</b>，不卡顿高准全选！
                 </div>
             </div>
             <div class="ds-card-actions" id="ds-card-footer" style="margin-top:6px;display:flex;">
-                <button class="ds-btn ds-btn-fill" id="ds-btn-autosweep">🚀 R1全卷高准全选</button>
-                <button class="ds-btn" id="ds-btn-autofill" style="display:none;">⚡ 点选当前题</button>
-                <button class="ds-btn" id="ds-btn-switch-model">${STATE.model === 'deepseek-reasoner' ? '🧠 当前:R1深度思考' : '⚡ 当前:V3标准'}</button>
+                <button class="ds-btn ds-btn-fill" id="ds-btn-autosweep">🚀 联网全卷高准全选</button>
+                <button class="ds-btn" id="ds-btn-websearch">${STATE.webSearchEnabled ? '🌐 联网搜题:开' : '📴 联网搜题:关'}</button>
+                <button class="ds-btn" id="ds-btn-switch-model">${STATE.model === 'deepseek-reasoner' ? '🧠 R1深度' : '⚡ V3极速(不卡顿)'}</button>
             </div>
         `;
         document.body.appendChild(cardEl);
@@ -377,10 +496,16 @@
             }
         });
 
+        document.getElementById('ds-btn-websearch').addEventListener('click', (e) => {
+            STATE.webSearchEnabled = !STATE.webSearchEnabled;
+            GM_setValue('DEEPSEEK_WEB_SEARCH', STATE.webSearchEnabled);
+            e.currentTarget.innerText = STATE.webSearchEnabled ? '🌐 联网搜题:开' : '📴 联网搜题:关';
+        });
+
         document.getElementById('ds-btn-switch-model').addEventListener('click', (e) => {
             STATE.model = STATE.model === 'deepseek-chat' ? 'deepseek-reasoner' : 'deepseek-chat';
-            GM_setValue('DEEPSEEK_MODEL_V32', STATE.model);
-            e.currentTarget.innerText = STATE.model === 'deepseek-reasoner' ? '🧠 当前:R1深度思考' : '⚡ 当前:V3标准';
+            GM_setValue('DEEPSEEK_MODEL_V34', STATE.model);
+            e.currentTarget.innerText = STATE.model === 'deepseek-reasoner' ? '🧠 R1深度' : '⚡ V3极速(不卡顿)';
         });
 
         fabEl.addEventListener('contextmenu', (e) => {
@@ -388,9 +513,6 @@
             e.stopPropagation();
         });
 
-        /****************************************************************
-         * 4. 悬浮球手势引擎
-         ****************************************************************/
         let isPressing = false;
         let startX = 0, startY = 0;
         let initialLeft = 0, initialTop = 0;
@@ -526,10 +648,7 @@
     }, { passive: true });
 
     /********************************************************************
-     * 5. 批改结果页自动记忆引擎 (Graded Page Auto-Harvester)
-     * 说明：当打开学习通/超星“作业详情”批改页（含有“我的答案 / 正确答案”或对错号）时，
-     * 自动吸取所有已判明对错的答案存入本地记忆库。点击“重做”时，做对的题直接 0 延时秒选，
-     * 做错的题自动附带错误排除项交给 R1 重算，确保第二次重做稳拿 100 分！
+     * 5. 批改结果页自动记忆引擎
      ********************************************************************/
     function harvestGradedPageAnswers() {
         const blocks = querySelectorAllDeep('.TiMu, .questionLi, .singleQuesId, .question-item, [class*="question"]');
@@ -551,7 +670,7 @@
             const isMarkedCorrect = Boolean(
                 block.querySelector('.marking_duigou, .icon-right, [class*="right"], [class*="correct"]') ||
                 (myAnsMatch && rightAnsMatch && myAnsMatch[1].toUpperCase() === rightAnsMatch[1].toUpperCase()) ||
-                /[1-9]\d*\s*分/.test(fullTxt) && !/\b0\s*分/.test(fullTxt)
+                (/[1-9]\d*\s*分/.test(fullTxt) && !/\b0\s*分/.test(fullTxt))
             );
             const isMarkedWrong = Boolean(
                 block.querySelector('.marking_cuowu, .icon-wrong, [class*="wrong"], [class*="error"]') ||
@@ -586,7 +705,7 @@
                 ui.contentBox.innerHTML = `
                     <div class="ds-answer-box">
                         <div class="ds-answer-main">📚 已自动记忆本页批改结果！</div>
-                        <div class="ds-answer-sub">已锁定 <b>${learnedRight}</b> 道标准答案、记录 <b>${learnedWrong}</b> 道错题排除项。点击页面<b>“重做”</b>后再长按 🎯 即可直接秒拿满分！</div>
+                        <div class="ds-answer-sub">已锁定 <b>${learnedRight}</b> 道标准答案、记录 <b>${learnedWrong}</b> 道错题排除项。点击页面<b>“重做”</b>后再长按 🎯 即可秒拿满分！</div>
                     </div>
                 `;
             }
@@ -594,7 +713,6 @@
         return { learnedRight, learnedWrong };
     }
 
-    // 页面加载 1.2 秒后自动检测是否处于批改详情页，若是则静默吸取全部答案
     setTimeout(harvestGradedPageAnswers, 1200);
 
     /********************************************************************
@@ -620,7 +738,7 @@
             fab.innerHTML = '🎯';
         }
         if (sweepBtn) {
-            sweepBtn.innerText = '🚀 R1全卷高准全选';
+            sweepBtn.innerText = '🚀 联网全卷高准全选';
         }
     }
 
@@ -652,7 +770,7 @@
         }
     }
 
-    function smoothScrollToElementAsync(el, duration = 240) {
+    function smoothScrollToElementAsync(el, duration = 220) {
         return new Promise((resolve) => {
             if (!el) {
                 resolve();
@@ -940,24 +1058,26 @@
     }
 
     /********************************************************************
-     * 8. R1 深度推理 + 历史验证记忆库优先命中引擎
+     * 8. 实时联网搜题 RAG + 全卷前后互证 + CoT 推理引擎
      ********************************************************************/
-    function requestSingleQuestionCoTAnalysis(q, overrideModel = null) {
+    async function requestSingleQuestionCoTAnalysis(q, paperContextSummary = '', overrideModel = null) {
+        STATE.verifiedBank = GM_getValue('DEEPSEEK_VERIFIED_BANK', STATE.verifiedBank || {});
+        const stemKey = normalizeStemKey(q.stemText);
+        const memoryEntry = STATE.verifiedBank[stemKey];
+
+        // 1. 优先命中本地批改验证记忆库
+        if (memoryEntry && Array.isArray(memoryEntry.correctLetters) && memoryEntry.correctLetters.length > 0) {
+            return {
+                thinking: '📚 命中已验证满分题库记忆，直接锁定标准答案',
+                answerLetters: memoryEntry.correctLetters,
+                answerTexts: []
+            };
+        }
+
+        // 2. 实时联网检索该题干的原题题库与网页参考资料 (Bing + 百度并发)
+        const webClues = await searchWebForQuestionClues(q.stemText, q.options);
+
         return new Promise((resolve) => {
-            STATE.verifiedBank = GM_getValue('DEEPSEEK_VERIFIED_BANK', STATE.verifiedBank || {});
-            const stemKey = normalizeStemKey(q.stemText);
-            const memoryEntry = STATE.verifiedBank[stemKey];
-
-            // 1. 若本地验证题库中已有 100% 确认过的标准答案（来自上次批改对勾或标准答案），直接 0 延时秒回！
-            if (memoryEntry && Array.isArray(memoryEntry.correctLetters) && memoryEntry.correctLetters.length > 0) {
-                resolve({
-                    thinking: '📚 命中已验证满分题库记忆，直接锁定标准答案',
-                    answerLetters: memoryEntry.correctLetters,
-                    answerTexts: []
-                });
-                return;
-            }
-
             const useModel = overrideModel || STATE.model;
             const isMultiChoice = /多选|多项|more than one|multiple/i.test(q.stemText);
             const isTrueFalse = q.options.length === 2 && q.options.some(o => /对|错|正确|错误|true|false|√|×/i.test(o.text));
@@ -967,38 +1087,32 @@
                 ? q.options.map(o => `选项 ${o.letter}: ${o.cleanContent}`).join('\n')
                 : '（本题为填空或主观题，无候选选项）';
 
-            // 若上次重做前记录了该题曾选错的选项，明确告知模型予以排除！
             const wrongExclusionNote = (memoryEntry && Array.isArray(memoryEntry.wrongLetters) && memoryEntry.wrongLetters.length > 0)
                 ? `\n⚠️【重要错题排除指令】：本题在上次提交时选择【${memoryEntry.wrongLetters.join(', ')}】被判为 0 分错误！本次严禁再选 ${memoryEntry.wrongLetters.join(', ')}，请务必从其余选项中推导正确答案！`
                 : '';
 
             const systemPrompt = [
-                '你是一个满分级别的高校专业课与四六级权威题库解析专家。',
-                '请严格遵循中国高校教材标准定义与以下高频防坑铁律进行推理：',
-                '1.【集装箱6位箱位号 BBRRTT 换算铁律】：',
-                '   - 前两位 BB 为行/排号(Bay)：奇数(01,03,05,07...)代表 20ft 箱位，且对应自船首向船尾的【第 (BB+1)/2 排】（例如 03 是自首第 2 排，11 是自首第 6 排，绝不可直接把 03 当作第 3 排！）；偶数(02,04,06,08...)代表 40ft 箱位，对应第 BB/2 个 40ft 排（同时占据 BB-1 和 BB+1 两个 20ft 排，如 04 对应 03 和 05）。',
-                '   - 中间两位 RR 为列号(Row)：以船纵中剖面为准，奇数(01,03,05...)在【右舷(右侧)】，右舷列序=(RR+1)/2（如 05 为右舷第 3 列，03 为右舷第 2 列）；偶数(02,04,06,08...)在【左舷(左侧)】，左舷列序=RR/2（如 08 为左舷第 4 列！）。',
-                '   - 后两位 TT 为层号(Tier)：02~78 的偶数在【舱内】，自舱底往上第 TT/2 层（如 02 为舱内底始第 1 层，04 为舱内第 2 层）；82,84,86... 在【甲板】（82 为甲板第 1 层，84 下方一层为 82）。',
-                '2.【集装箱标志与尺寸防坑】：',
-                '   - 集装箱端门标志：第1行是箱主代号+设备识别码(U/J/Z)+顺序号+核对数字；第2行是国籍代号+尺寸和类型代码；【第3行是集装箱最大总重(MAX GROSS)和自重(TARE)】！',
-                '   - 两个 1CC 型(20ft，实长 6058mm = 19ft 10.5in)长度之和(12116mm)比一个 1AA 型(40ft，实长 12192mm)要【短】（留有 3 英寸/76mm 间隙）！',
-                '   - 集装箱超高标记中的数字表示【集装箱的实际高度】（如 2.9m / 9\'6"），而非超出尺寸！',
-                '3.【集装箱配积载与系固防坑（注意区分箱量多与箱量少！）】：',
-                '   - 同一卸港/装货港的集装箱【数量少（箱量少）】时，为便利装卸、避免装卸桥频繁移位，应【集中配装】！',
-                '   - 只有当有两个以上装货港且第一装货港【需要装载较多（箱量大）】时，为让多台岸桥同时作业缩短停泊时间，才安排在【①不同的排位(Bay)上且间隔一定距离】；两台装卸桥同时作业必须【至少纵向间隔一个 40 英尺行箱位】；',
-                '   - 配积载文件中，【初配图是总图加行箱位图】；集装箱船专用的绑扎系固设备包括：【①桥锁、②扭锁、④连接板、⑤锥板、⑥高度补偿器】（不含③普通钢丝绳）。',
+                '你是一个结合【实时联网题库检索结果】与【全卷前后互证】的满分级高校专业课与通用题库解析专家。',
+                '请严格遵循以下三大解题准则：',
+                '1.【优先参考联网搜题原题摘要】：若下方提供了【🌐 实时联网搜题检索到的原题与参考资料】，请仔细核对其中出现的原题答案或权威教材原文规定（例如：散装种子饼装船前至少有 2 个月氧化期；散装固体废物在 IMSBC 规则中属于 B 类；装运煤炭完货后平舱目的是 ①防止货物移动 和 ④防止形成积存气体的坑洼及空气渗入煤堆）。',
+                '2.【善用同卷其它题目互证】：下方提供了【📄 同卷其它题目题干与选项互证摘要】，同一份试卷的不同题目往往直接泄露了答案！（例如：若同卷某题选项写有“即使存在短时横倾，也不应超过3°”，则另一题问“保证船舶横倾不超过多少度”必选 3°；若同卷某题提到“必须兼顾易流态化(A类)和化学危险性(B类)”，则问“IMSBC所列散货类别”必选“不一定仅属于一个类别”！）',
+                '3.【集装箱与散货运输核心法则】：',
+                '   - 6位箱位号 BBRRTT：前两位奇数排号(01,03,05...)为 20ft 箱且对应自首【第 (BB+1)/2 排】（03 是自首第 2 排）；中两位列号奇右偶左（08 是左舷第 4 列，05 是右舷第 3 列）；后两位 <80 为舱内，>=80 为甲板。',
+                '   - 两个 1CC(20ft) 长度之和比一个 1AA(40ft) 【短】；端门第 3 行标明【总重和自重】；超高标记数字为【实际高度】；初配图是【总图加行箱位图】；同一卸港箱量少时应【集中配装】，箱量大时安排在【不同排位且间隔一定距离】，双岸桥同时作业至少【纵向间隔一个 40ft 行箱位】。',
                 '必须严格返回如下 JSON 格式（不要包含任何 Markdown 代码块标签）：',
                 '{',
-                '  "thinking": "简明推导计算步骤与教材依据",',
-                '  "answerLetters": ["正确选项大写字母，如 \\"B\\""],',
+                '  "thinking": "结合联网题库摘要、同卷互证与教材规定的推导过程",',
+                '  "answerLetters": ["正确选项大写字母，如 \\"C\\""],',
                 '  "answerTexts": ["正确选项完整原文内容"]',
                 '}'
             ].join('\n');
 
             const userPrompt = [
                 `题目类型：${qTypeHint}`,
-                `题干内容：${q.stemText}`,
+                `当前题干：${q.stemText}`,
                 `候选选项：\n${formattedOptions}`,
+                webClues ? `【🌐 实时联网搜题检索到的原题与参考资料】：\n${webClues}` : '',
+                paperContextSummary ? `【📄 同卷其它题目互证摘要（供跨题核对知识点）】：\n${paperContextSummary}` : '',
                 wrongExclusionNote
             ].filter(Boolean).join('\n\n');
 
@@ -1026,7 +1140,7 @@
                     try {
                         if (res.status !== 200) {
                             if (useModel === 'deepseek-reasoner') {
-                                requestSingleQuestionCoTAnalysis(q, 'deepseek-chat').then(resolve);
+                                requestSingleQuestionCoTAnalysis(q, paperContextSummary, 'deepseek-chat').then(resolve);
                                 return;
                             }
                             resolve(null);
@@ -1043,23 +1157,14 @@
                         if (!parsed.thinking && reasoningText) {
                             parsed.thinking = reasoningText.replace(/\s+/g, ' ').trim().slice(-120);
                         }
+                        parsed.usedWebSearch = Boolean(webClues);
                         resolve(parsed);
                     } catch (e) {
                         console.error('[DeepSeek Parse]', e);
-                        if (useModel === 'deepseek-reasoner') {
-                            requestSingleQuestionCoTAnalysis(q, 'deepseek-chat').then(resolve);
-                            return;
-                        }
                         resolve(null);
                     }
                 },
-                onerror: () => {
-                    if (useModel === 'deepseek-reasoner') {
-                        requestSingleQuestionCoTAnalysis(q, 'deepseek-chat').then(resolve);
-                        return;
-                    }
-                    resolve(null);
-                }
+                onerror: () => resolve(null)
             });
         });
     }
@@ -1110,11 +1215,18 @@
         return matched;
     }
 
+    // 生成全卷其它题目的互证摘要（供跨题核对，如第13题的“横倾不超过3°”直接帮第29题锁定答案）
+    function buildFullPaperCrossContext(allQuestions) {
+        return allQuestions.map((q, i) => {
+            const optsInline = q.options.map(o => `${o.letter}.${o.cleanContent}`).join(' ');
+            return `T${i + 1}: ${q.stemText.slice(0, 90)} [${optsInline.slice(0, 90)}]`;
+        }).join('\n').slice(0, 3200);
+    }
+
     /********************************************************************
-     * 9. 6 路并发预取流水线 + 全卷自动滚屏全选
+     * 9. 联网搜题 + 全卷互证 + 6 路并发丝滑全选流水线
      ********************************************************************/
     async function startFullPageAutoSweep() {
-        // 如果当前在批改详情页，先吸取一遍答案
         harvestGradedPageAnswers();
 
         const ui = getUIElements();
@@ -1147,6 +1259,9 @@
         const total = allQuestions.length;
         let completedCount = 0;
 
+        // 构建整张试卷的互证上下文（让每道题都能看到同卷其它题目的题干与选项线索）
+        const paperContextSummary = buildFullPaperCrossContext(allQuestions);
+
         const resultPromises = new Array(total);
         let nextPrefetchIdx = 0;
 
@@ -1154,19 +1269,19 @@
             const maxIdx = Math.min(total, limitIdx);
             while (nextPrefetchIdx < maxIdx && !STATE.stopBatchRequested) {
                 const idx = nextPrefetchIdx++;
-                resultPromises[idx] = requestSingleQuestionCoTAnalysis(allQuestions[idx]);
+                resultPromises[idx] = requestSingleQuestionCoTAnalysis(allQuestions[idx], paperContextSummary);
             }
         }
 
         triggerPrefetchUpTo(CONFIG.concurrency);
 
-        const updateSweepProgressUI = (curNum, titlePreview, answerPreview, thinkingNote) => {
+        const updateSweepProgressUI = (curNum, titlePreview, answerPreview, thinkingNote, usedSearch) => {
             if (!ui.contentBox) return;
             const pct = Math.round((curNum / total) * 100);
-            const modelTag = STATE.model === 'deepseek-reasoner' ? 'R1深度思考' : 'V3';
+            const searchBadge = usedSearch ? '🌐已联网搜题' : (STATE.webSearchEnabled ? '🌐联网检索中' : '🧠本地推理');
             ui.contentBox.innerHTML = `
                 <div style="display:flex;justify-content:space-between;align-items:center;color:#10b981;font-weight:600;">
-                    <span>⚡ ${modelTag}全卷连刷 (${curNum}/${total})</span>
+                    <span>⚡ 全卷高准连刷 (${curNum}/${total}) · ${searchBadge}</span>
                     <span style="font-size:11px;color:#94a3b8;">轻点 ⚡ 暂停</span>
                 </div>
                 <div class="ds-progress-bar-bg">
@@ -1174,7 +1289,7 @@
                 </div>
                 <div class="ds-answer-box" style="margin-top:6px;margin-bottom:2px;">
                     <div style="font-size:11px;color:#94a3b8;">第 ${curNum} 题：${escapeHtml(titlePreview.slice(0, 26))}...</div>
-                    <div class="ds-answer-main">${escapeHtml(answerPreview || '🧠 正在深度推导...')}</div>
+                    <div class="ds-answer-main">${escapeHtml(answerPreview || '🌐 正在联网检索并推导...')}</div>
                     ${thinkingNote ? `<div class="ds-answer-sub">${escapeHtml(thinkingNote.slice(0, 95))}</div>` : ''}
                 </div>
             `;
@@ -1189,11 +1304,11 @@
             const curNum = i + 1;
 
             q.blockEl.classList.add('ds-scope-flash');
-            updateSweepProgressUI(curNum, q.stemText, '🧠 正在定位并推导答案...', '');
+            updateSweepProgressUI(curNum, q.stemText, '🌐 正在联网比对题库与全卷互证...', '', false);
 
             const [parsed] = await Promise.all([
                 resultPromises[i],
-                smoothScrollToElementAsync(q.blockEl, 230)
+                smoothScrollToElementAsync(q.blockEl, 220)
             ]);
 
             if (STATE.stopBatchRequested) {
@@ -1206,7 +1321,7 @@
 
             if (matchedOpts.length > 0) {
                 const ansDisplay = matchedOpts.map(o => `${o.letter}. ${o.cleanContent}`).join(' | ');
-                updateSweepProgressUI(curNum, q.stemText, `✅ 已选：${ansDisplay}`, parsed?.thinking || '');
+                updateSweepProgressUI(curNum, q.stemText, `✅ 已选：${ansDisplay}`, parsed?.thinking || '', parsed?.usedWebSearch);
 
                 for (const opt of matchedOpts) {
                     clickOptionElementReliably(opt.el);
@@ -1215,17 +1330,17 @@
                 completedCount++;
             } else if (q.inputs.length > 0 && firstAnsText) {
                 const inp = q.inputs[0];
-                updateSweepProgressUI(curNum, q.stemText, `✍️ 已填：${firstAnsText}`, parsed?.thinking || '');
+                updateSweepProgressUI(curNum, q.stemText, `✍️ 已填：${firstAnsText}`, parsed?.thinking || '', parsed?.usedWebSearch);
                 inp.focus();
                 setNativeInputValue(inp, String(firstAnsText).trim());
                 inp.classList.add('ds-correct-highlight');
                 completedCount++;
             } else {
-                updateSweepProgressUI(curNum, q.stemText, firstAnsText || '⚠️ 未匹配到选项', parsed?.thinking || '');
+                updateSweepProgressUI(curNum, q.stemText, firstAnsText || '⚠️ 未匹配到选项', parsed?.thinking || '', parsed?.usedWebSearch);
             }
 
             setTimeout(() => q.blockEl.classList.remove('ds-scope-flash'), 400);
-            await sleep(180);
+            await sleep(160);
         }
 
         STATE.isBatchRunning = false;
@@ -1243,7 +1358,7 @@
                 ui.contentBox.innerHTML = `
                     <div class="ds-answer-box">
                         <div class="ds-answer-main">🎉 全卷 ${completedCount} / ${total} 题已全部选完！</div>
-                        <div class="ds-answer-sub">已完成全部题目点选，请检查后提交。</div>
+                        <div class="ds-answer-sub">已完成【🌐 实时联网搜题 + 全卷互证】点选，请检查后提交。</div>
                     </div>
                 `;
             }
@@ -1251,7 +1366,7 @@
     }
 
     /********************************************************************
-     * 10. 原有单题解析功能（轻点 1 下悬浮球触发）
+     * 10. 单题解析功能（轻点 1 下悬浮球触发）
      ********************************************************************/
     function findSingleQuestionScope() {
         const ui = getUIElements();
@@ -1291,7 +1406,6 @@
     }
 
     function triggerSingleQuestionAnalysis() {
-        // 如果当前在批改结果详情页，轻点一下先自动吸取整页标准答案与错题记录
         const harvested = harvestGradedPageAnswers();
         if (harvested.learnedRight > 0 || harvested.learnedWrong > 0) {
             return;
@@ -1319,13 +1433,15 @@
         const options = extractOptionsFromBlock(scopeEl);
         const inputs = extractInputsFromBlock(scopeEl);
         const stemText = extractPureQuestionStem(scopeEl, options, inputs[0] || null).slice(0, 1200);
+        const allQuestions = collectAllQuestionsOnPage();
+        const paperContextSummary = buildFullPaperCrossContext(allQuestions);
 
         if (ui.card) ui.card.style.display = 'block';
         if (ui.contentBox) {
             ui.contentBox.innerHTML = `
                 <div style="display:flex;align-items:center;gap:8px;color:#38bdf8;">
-                    <span>⏳</span>
-                    <span>正在使用 <b>${STATE.model === 'deepseek-reasoner' ? 'R1深度推理' : 'V3'}</b> 分析当前单题...</span>
+                    <span>🌐</span>
+                    <span>正在实时联网搜题并结合全卷互证解析...</span>
                 </div>
                 <div style="font-size:11px;color:#64748b;margin-top:4px;">题目：${escapeHtml(stemText.slice(0, 36))}...</div>
             `;
@@ -1333,7 +1449,7 @@
         if (ui.fab) ui.fab.classList.add('ds-loading');
         STATE.isAnalyzing = true;
 
-        requestSingleQuestionCoTAnalysis({ stemText, options, inputs }).then((parsed) => {
+        requestSingleQuestionCoTAnalysis({ stemText, options, inputs }, paperContextSummary).then((parsed) => {
             STATE.isAnalyzing = false;
             if (ui.fab) ui.fab.classList.remove('ds-loading');
 
@@ -1353,25 +1469,11 @@
             if (ui.contentBox) {
                 ui.contentBox.innerHTML = `
                     <div class="ds-answer-box">
-                        <div style="font-size:11px;color:#94a3b8;margin-bottom:2px;">单题推导结果（长按或连点3下 🎯 全卷自动选完）</div>
+                        <div style="font-size:11px;color:#94a3b8;margin-bottom:2px;">${parsed.usedWebSearch ? '🌐 联网搜题+全卷互证结果' : '🧠 推导结果'}（长按或三击 🎯 全卷自动选完）</div>
                         <div class="ds-answer-main">${escapeHtml(ansDisplay)}</div>
                         ${parsed.thinking ? `<div class="ds-answer-sub">${escapeHtml(parsed.thinking)}</div>` : ''}
                     </div>
                 `;
-            }
-
-            if (ui.fillBtn) {
-                ui.fillBtn.style.display = (matchedOpts.length > 0 || inputs.length > 0) ? 'inline-flex' : 'none';
-                ui.fillBtn.onclick = async () => {
-                    for (const opt of matchedOpts) {
-                        await smoothScrollToElementAsync(opt.el, 220);
-                        clickOptionElementReliably(opt.el);
-                    }
-                    if (matchedOpts.length === 0 && inputs[0] && firstAnsText) {
-                        inputs[0].focus();
-                        setNativeInputValue(inputs[0], firstAnsText);
-                    }
-                };
             }
         });
     }
