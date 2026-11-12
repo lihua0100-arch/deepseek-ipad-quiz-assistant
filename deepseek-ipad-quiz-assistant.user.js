@@ -1,10 +1,10 @@
 // ==UserScript==
-// @name         DeepSeek 智能题库助手 (iPad 学习通/U校园/全平台触屏通用版)
+// @name    DeepSeek 智能题库助手 (iPad 学习通/U校园/全平台触屏通用版)
 // @namespace    https://tampermonkey.net/
-// @version      2.1.0
+// @version      3.0.0
 // @updateURL    https://raw.githubusercontent.com/lihua0100-arch/deepseek-ipad-quiz-assistant/main/deepseek-ipad-quiz-assistant.user.js
 // @downloadURL  https://raw.githubusercontent.com/lihua0100-arch/deepseek-ipad-quiz-assistant/main/deepseek-ipad-quiz-assistant.user.js
-// @description  专为 iPad Safari (学习通 mooc1.chaoxing.com / U校园 / 各类网课) 打造：修复沙箱 PointerEvent 报错导致无法自动点击与卡死旋转的问题；支持长按悬浮球触发“高速涡轮旋转 + 强制平滑滚屏居中 + 自动选中学习通/U校园选项”，再次长按还可自动滚屏推进到下一题连刷！
+// @description  专为 iPad Safari 与 Mac 打造（全面适配学习通 mooc1.chaoxing.com、U校园、超星尔雅、各类网课）：保留单击悬浮球看单题答案；新增“长按悬浮球”或“连续点三下悬浮球”触发高速涡轮旋转特效，直接从第1题到最后一题平滑滚动屏幕，并通过页面主环境桥接器把整张试卷所有正确选项全部自动选上！
 // @author       Gemini
 // @match        *://*/*
 // @allFrames    true
@@ -27,56 +27,123 @@
     const MOD_KEY_LABEL = IS_MAC ? '⌃Ctrl(或⌥Opt)' : 'Alt';
 
     /********************************************************************
-     * 1. 配置参数与状态管理
+     * 1. 配置参数与全局状态
      ********************************************************************/
     const CONFIG = {
         apiUrl: 'https://api.deepseek.com/chat/completions',
-        longPressDuration: 450    // 长按触发高速旋转与自动滚屏点选的毫秒阈值
+        longPressDuration: 450,   // 长按触发全卷自动连刷的毫秒阈值
+        batchSize: 4              // 全卷连刷时每次批量并发解析的题目数（大幅提速，滚屏零等待）
     };
 
-    // 保持脚本 @name、@namespace 和 GM 存储字段稳定，原位更新时沿用旧 Key 与模型设置。
     const STATE = {
         apiKey: GM_getValue('DEEPSEEK_API_KEY', ''),
         model: GM_getValue('DEEPSEEK_MODEL', 'deepseek-chat'),
         isAnalyzing: false,
+        isBatchRunning: false,    // 是否正在执行“从头到尾全卷自动滚屏全选”
+        stopBatchRequested: false,
         lastPickedScope: null,
-        lastSolvedScopeEl: null,  // 记录上一道已完成的题块容器（用于连续长按自动推进下一题）
-        lastTouchTime: 0,
         lastMousePos: { x: window.innerWidth / 2, y: window.innerHeight / 2 },
         pickerMode: false,
         hoveredPickerEl: null,
-        lastResultData: null      // 缓存最近一次解析出的结果与对应 DOM 节点
+        lastResultData: null
     };
 
     /********************************************************************
-     * 2. UI 样式：含高速涡轮旋转特效 (ds-turbo-spin) 与点选波纹动画
+     * 2. 页面主环境点击桥接器 (Main-World Click & Scroll Bridge)
+     * 说明：iPad Safari 的 Userscripts / Tampermonkey 运行在隔离沙箱中，
+     * 直接在沙箱调 .click() 有时无法触发学习通 (mooc1.chaoxing.com) 页面里的
+     * jQuery / Zepto / Vue 或内联 onclick="addChoice(this)"。
+     * 通过向页面注入一段原生 <script>，在网页真实主环境中执行点击与 jQuery 触发！
+     ********************************************************************/
+    function injectMainWorldBridge() {
+        if (document.getElementById('ds-mainworld-bridge')) return;
+        const script = document.createElement('script');
+        script.id = 'ds-mainworld-bridge';
+        script.textContent = `
+            (function() {
+                window.addEventListener('ds-mainworld-click', function() {
+                    var targets = document.querySelectorAll('[data-ds-click-target]');
+                    targets.forEach(function(el) {
+                        el.removeAttribute('data-ds-click-target');
+                        try {
+                            // 1. 识别学习通/超星、AntD、ElementUI 的核心可点击行与圆圈按钮
+                            var row = el.closest('.answerBg, .single_choice li, .multi_choice li, .true_false li, .answerList li, .ant-radio-wrapper, .ant-checkbox-wrapper, .el-radio, .el-checkbox, li') || el;
+                            var badge = row.querySelector('.num_option, .num_option_dx, .ans-radio, .ans-checkbox, input[type="radio"], input[type="checkbox"], .ant-radio-input, .ant-checkbox-input, a, label');
+
+                            var isSelected = function(node) {
+                                if (!node) return false;
+                                if (node.querySelector('input:checked')) return true;
+                                if (node.querySelector('.check_answer, .check_answer_dx, .ant-radio-checked, .ant-checkbox-checked, .is-checked')) return true;
+                                return /\\b(check_answer|check_answer_dx|checked|selected|active|cur|on)\\b/i.test(node.className || '');
+                            };
+
+                            // 若已经是选中状态，则不重复点击（防止把多选题取消勾选）
+                            if (isSelected(row)) return;
+
+                            var triggerNode = function(n) {
+                                if (!n) return;
+                                // 优先尝试调用页面原生的 jQuery / Zepto 事件触发
+                                if (window.jQuery) {
+                                    try { window.jQuery(n).trigger('tap'); } catch(_) {}
+                                    try { window.jQuery(n).trigger('click'); } catch(_) {}
+                                } else if (window.$ && typeof window.$.fn === 'object') {
+                                    try { window.$(n).trigger('tap'); } catch(_) {}
+                                    try { window.$(n).trigger('click'); } catch(_) {}
+                                }
+                                // 派发原生鼠标与触摸事件并执行 click()
+                                try { n.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true })); } catch(_) {}
+                                try { n.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true })); } catch(_) {}
+                                try { n.click(); } catch(_) {}
+                            };
+
+                            // 先点外层选项行 (.answerBg / li)
+                            triggerNode(row);
+
+                            // 若未变为选中态，再补点内部的圆圈字母 (.num_option) 或原节点
+                            if (!isSelected(row) && badge && badge !== row) {
+                                triggerNode(badge);
+                            }
+                            if (!isSelected(row) && el !== row && el !== badge) {
+                                triggerNode(el);
+                            }
+                        } catch (err) {
+                            console.error('[DS MainWorld Click]', err);
+                        }
+                    });
+                });
+            })();
+        `;
+        (document.head || document.documentElement).appendChild(script);
+    }
+    injectMainWorldBridge();
+
+    /********************************************************************
+     * 3. UI 样式：高速涡轮旋转特效 (ds-turbo-spin) 与全卷连刷进度卡片
      ********************************************************************/
     const isTopFrame = window.self === window.top;
 
     const styleEl = document.createElement('style');
     styleEl.textContent = `
-        /* 强力解封网页文字选中限制 */
         html, body, body * {
             -webkit-user-select: text !important;
             user-select: text !important;
             -webkit-touch-callout: default !important;
         }
 
-        /* 可拖动悬浮球 */
         #ds-fab {
             position: fixed;
             right: 22px;
             bottom: 240px;
-            width: 52px;
-            height: 52px;
+            width: 54px;
+            height: 54px;
             border-radius: 50%;
-            background: rgba(15, 23, 42, 0.9);
+            background: rgba(15, 23, 42, 0.92);
             color: #38bdf8;
             display: flex;
             align-items: center;
             justify-content: center;
-            box-shadow: 0 4px 18px rgba(0, 0, 0, 0.4);
-            border: 1.5px solid rgba(56, 189, 248, 0.4);
+            box-shadow: 0 4px 18px rgba(0, 0, 0, 0.42);
+            border: 1.5px solid rgba(56, 189, 248, 0.45);
             backdrop-filter: blur(12px);
             -webkit-backdrop-filter: blur(12px);
             z-index: 2147483647;
@@ -85,7 +152,7 @@
             -webkit-user-select: none !important;
             -webkit-touch-callout: none !important;
             -webkit-tap-highlight-color: transparent;
-            font-size: 22px;
+            font-size: 23px;
             cursor: pointer;
             transition: transform 0.18s ease, box-shadow 0.2s ease, border-color 0.2s ease;
         }
@@ -93,7 +160,6 @@
             transform: scale(0.92);
         }
 
-        /* 普通解析加载中旋转 */
         #ds-fab.ds-loading {
             animation: ds-spin-normal 1.1s linear infinite;
         }
@@ -102,31 +168,30 @@
             100% { transform: rotate(360deg); }
         }
 
-        /* 长按触发：高速涡轮旋转特效 + 翡翠霓虹光环 */
+        /* 长按/三击触发：高速涡轮旋转特效 + 翡翠流光光环 */
         #ds-fab.ds-turbo-spin {
             border-color: #10b981 !important;
-            background: radial-gradient(circle, rgba(6, 95, 70, 0.96) 0%, rgba(15, 23, 42, 0.96) 100%) !important;
-            box-shadow: 0 0 25px rgba(16, 185, 129, 0.95), 0 0 50px rgba(56, 189, 248, 0.7) !important;
-            animation: ds-spin-turbo 0.2s linear infinite !important;
+            background: radial-gradient(circle, rgba(6, 95, 70, 0.98) 0%, rgba(15, 23, 42, 0.98) 100%) !important;
+            box-shadow: 0 0 28px rgba(16, 185, 129, 0.98), 0 0 56px rgba(56, 189, 248, 0.75) !important;
+            animation: ds-spin-turbo 0.18s linear infinite !important;
         }
         @keyframes ds-spin-turbo {
             0% { transform: scale(1.14) rotate(0deg); }
-            50% { transform: scale(1.2) rotate(180deg); }
+            50% { transform: scale(1.22) rotate(180deg); }
             100% { transform: scale(1.14) rotate(360deg); }
         }
 
-        /* 答案弹窗卡片 */
         #ds-card {
             position: fixed;
             right: 16px;
-            bottom: 95px;
-            width: 335px;
+            bottom: 92px;
+            width: 340px;
             max-width: calc(100vw - 32px);
             background: rgba(15, 23, 42, 0.95);
             color: #f8fafc;
             border-radius: 14px;
-            border: 1px solid rgba(148, 163, 184, 0.3);
-            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+            border: 1px solid rgba(148, 163, 184, 0.32);
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.52);
             backdrop-filter: blur(14px);
             -webkit-backdrop-filter: blur(14px);
             z-index: 2147483646;
@@ -167,7 +232,7 @@
         }
 
         .ds-answer-box {
-            background: rgba(30, 41, 59, 0.75);
+            background: rgba(30, 41, 59, 0.78);
             border-radius: 8px;
             padding: 8px 10px;
             margin-bottom: 8px;
@@ -186,6 +251,21 @@
             color: #cbd5e1;
             margin-top: 4px;
             line-height: 1.4;
+        }
+
+        .ds-progress-bar-bg {
+            width: 100%;
+            height: 6px;
+            background: rgba(51, 65, 85, 0.8);
+            border-radius: 3px;
+            overflow: hidden;
+            margin: 6px 0;
+        }
+        .ds-progress-bar-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #10b981, #38bdf8);
+            width: 0%;
+            transition: width 0.25s ease;
         }
 
         .ds-card-actions {
@@ -216,7 +296,6 @@
             font-weight: 500;
         }
 
-        /* 正确选项高亮与自动点选脉冲动画 */
         .ds-correct-highlight {
             outline: 2px solid #10b981 !important;
             background-color: rgba(16, 185, 129, 0.14) !important;
@@ -237,12 +316,6 @@
             border-radius: 6px !important;
             transition: outline 0.3s ease !important;
         }
-        .ds-picker-highlight {
-            outline: 2px solid rgba(56, 189, 248, 0.9) !important;
-            background-color: rgba(56, 189, 248, 0.08) !important;
-            outline-offset: 3px !important;
-            border-radius: 4px !important;
-        }
     `;
     document.head.appendChild(styleEl);
 
@@ -252,7 +325,6 @@
     let fabEl = null;
     let cardEl = null;
 
-    // 供主窗口或同源内层框架统一获取 UI 节点
     function getUIElements() {
         try {
             const topDoc = window.top.document;
@@ -261,8 +333,8 @@
                 card: topDoc.getElementById('ds-card') || cardEl,
                 contentBox: topDoc.getElementById('ds-card-content'),
                 footerBox: topDoc.getElementById('ds-card-footer'),
+                sweepBtn: topDoc.getElementById('ds-btn-autosweep'),
                 fillBtn: topDoc.getElementById('ds-btn-autofill'),
-                altBtn: topDoc.getElementById('ds-btn-alt-cycle'),
                 modelBtn: topDoc.getElementById('ds-btn-switch-model')
             };
         } catch (_) {
@@ -271,8 +343,8 @@
                 card: cardEl,
                 contentBox: document.getElementById('ds-card-content'),
                 footerBox: document.getElementById('ds-card-footer'),
+                sweepBtn: document.getElementById('ds-btn-autosweep'),
                 fillBtn: document.getElementById('ds-btn-autofill'),
-                altBtn: document.getElementById('ds-btn-alt-cycle'),
                 modelBtn: document.getElementById('ds-btn-switch-model')
             };
         }
@@ -282,26 +354,26 @@
         fabEl = document.createElement('div');
         fabEl.id = 'ds-fab';
         fabEl.innerHTML = '🎯';
-        fabEl.title = '轻点：显示答案 | 长按：高速旋转 + 滚屏居中 + 自动点击选项（再长按自动连刷下一题）';
+        fabEl.title = '单击：解析单题 | 长按 或 连点3下：从头到尾自动滚屏并把所有选项全选上！';
         document.body.appendChild(fabEl);
 
         cardEl = document.createElement('div');
         cardEl.id = 'ds-card';
         cardEl.innerHTML = `
             <div class="ds-card-header">
-                <span class="ds-card-title">💡 DeepSeek 题库助手 2.1</span>
+                <span class="ds-card-title">💡 DeepSeek 题库助手 3.0</span>
                 <span class="ds-card-close" id="ds-card-close-btn">✕</span>
             </div>
             <div id="ds-card-content">
                 <div style="color:#94a3b8;font-size:12px;">
-                    • <b>轻点 🎯 悬浮球</b>：解析当前题目并显示答案<br>
-                    • <b>长按 🎯 悬浮球 (0.45秒)</b>：触发<b>高速涡轮旋转</b>，平滑滚屏居中并<b>自动点击正确选项</b>（再次长按自动跳到下一题连刷！）
+                    • <b>轻点 1 下 🎯</b>：解析当前单题并显示答案<br>
+                    • <b>长按 🎯 或 连续点 3 下 🎯</b>：触发<b>高速涡轮旋转</b>，直接<b>从第 1 题到最后一题自动滚屏并把所有正确选项全部选上</b>！（运行中轻点可随时停止）
                 </div>
             </div>
-            <div class="ds-card-actions" id="ds-card-footer" style="margin-top:6px;display:none;">
-                <button class="ds-btn ds-btn-fill" id="ds-btn-autofill">⚡ 滚屏并自动点选</button>
-                <button class="ds-btn" id="ds-btn-alt-cycle">🔄 切换备选</button>
-                <button class="ds-btn" id="ds-btn-switch-model">🧠 切R1/V3</button>
+            <div class="ds-card-actions" id="ds-card-footer" style="margin-top:6px;display:flex;">
+                <button class="ds-btn ds-btn-fill" id="ds-btn-autosweep">🚀 全卷从头到尾自动全选</button>
+                <button class="ds-btn" id="ds-btn-autofill" style="display:none;">⚡ 点选当前题</button>
+                <button class="ds-btn" id="ds-btn-switch-model">⚡ 当前V3</button>
             </div>
         `;
         document.body.appendChild(cardEl);
@@ -310,14 +382,27 @@
             cardEl.style.display = 'none';
         });
 
-        // 阻止 iPad 长按悬浮球时弹出系统放大镜或右键菜单
+        document.getElementById('ds-btn-autosweep').addEventListener('click', () => {
+            if (STATE.isBatchRunning) {
+                STATE.stopBatchRequested = true;
+            } else {
+                startFullPageAutoSweep();
+            }
+        });
+
+        document.getElementById('ds-btn-switch-model').addEventListener('click', (e) => {
+            STATE.model = STATE.model === 'deepseek-chat' ? 'deepseek-reasoner' : 'deepseek-chat';
+            GM_setValue('DEEPSEEK_MODEL', STATE.model);
+            e.currentTarget.innerText = STATE.model === 'deepseek-reasoner' ? '🧠 当前R1' : '⚡ 当前V3';
+        });
+
         fabEl.addEventListener('contextmenu', (e) => {
             e.preventDefault();
             e.stopPropagation();
         });
 
         /****************************************************************
-         * 3. 悬浮球手势引擎：区分「轻点」「拖拽移动」与「长按涡轮自动点选」
+         * 4. 悬浮球手势引擎：支持「单击单题」「长按全卷连刷」「三连击全卷连刷」「拖拽」
          ****************************************************************/
         let isPressing = false;
         let startX = 0, startY = 0;
@@ -325,6 +410,10 @@
         let hasMoved = false;
         let longPressTriggered = false;
         let longPressTimer = null;
+
+        // 记录连续点击次数（检测三连击）
+        let tapCount = 0;
+        let tapResolveTimer = null;
 
         const clearLongPressTimer = () => {
             if (longPressTimer) {
@@ -347,7 +436,10 @@
             longPressTimer = setTimeout(() => {
                 if (isPressing && !hasMoved) {
                     longPressTriggered = true;
-                    handleLongPressTurboAction();
+                    tapCount = 0;
+                    if (tapResolveTimer) clearTimeout(tapResolveTimer);
+                    // 长按直接启动全卷从头到尾自动滚屏全选！
+                    startFullPageAutoSweep();
                 }
             }, CONFIG.longPressDuration);
         };
@@ -402,41 +494,42 @@
 
         window.addEventListener('mouseup', onPointerEnd);
 
+        // 点击与三连击判别逻辑
         fabEl.addEventListener('click', (e) => {
             e.preventDefault();
             e.stopPropagation();
             if (hasMoved || longPressTriggered) return;
-            triggerAnalysis({ autoExecute: false });
+
+            // 如果正在全卷连刷过程中，轻点一下悬浮球即可随时紧急暂停/停止
+            if (STATE.isBatchRunning) {
+                STATE.stopBatchRequested = true;
+                return;
+            }
+
+            tapCount += 1;
+            if (tapResolveTimer) clearTimeout(tapResolveTimer);
+
+            if (tapCount >= 3) {
+                // 连续按三下：直接触发全卷从头到尾自动滚屏全选！
+                tapCount = 0;
+                startFullPageAutoSweep();
+            } else {
+                // 等待 320ms 看是否继续连点；若只点了 1~2 下，则执行单题解析
+                tapResolveTimer = setTimeout(() => {
+                    tapCount = 0;
+                    triggerSingleQuestionAnalysis();
+                }, 320);
+            }
         });
     }
 
-    // 在主窗口与所有同源子 iframe 中记录用户的触摸/点击位置
-    window.addEventListener('mousemove', (e) => {
-        STATE.lastMousePos.x = e.clientX;
-        STATE.lastMousePos.y = e.clientY;
-        if (STATE.pickerMode) {
-            updatePickerHighlight(e.clientX, e.clientY);
-        }
-    }, { passive: true });
-
+    // 记录用户最后触摸或点击的题目节点
     window.addEventListener('click', (e) => {
         const hit = e.target;
         const ui = getUIElements();
         if (hit && (!ui.fab || !ui.fab.contains(hit)) && (!ui.card || !ui.card.contains(hit))) {
-            // 如果不是脚本自动触发的合成点击，则记录为用户主动手点选的题目
             if (e.isTrusted) {
                 STATE.lastPickedScope = hit;
-                STATE.lastTouchTime = Date.now();
-            }
-        }
-
-        if (STATE.pickerMode) {
-            e.preventDefault();
-            e.stopPropagation();
-            const picked = STATE.hoveredPickerEl;
-            togglePickerMode(false);
-            if (picked) {
-                triggerAnalysis({ explicitScope: picked, autoExecute: false });
             }
         }
     }, true);
@@ -446,7 +539,6 @@
         const ui = getUIElements();
         if (hit && (!ui.fab || !ui.fab.contains(hit)) && (!ui.card || !ui.card.contains(hit))) {
             STATE.lastPickedScope = hit;
-            STATE.lastTouchTime = Date.now();
             if (e.touches[0]) {
                 STATE.lastMousePos.x = e.touches[0].clientX;
                 STATE.lastMousePos.y = e.touches[0].clientY;
@@ -455,399 +547,175 @@
     }, { passive: true });
 
     /********************************************************************
-     * 4. 核心修复：iPad Safari 跨容器/跨 iframe 平滑居中滚屏 + 零报错真实点击引擎
+     * 5. 涡轮旋转动画、跨容器平滑滚屏与页面主环境点击执行
      ********************************************************************/
-    let turboSafetyTimer = null;
-
     function startTurboSpinEffect() {
-        const { fab } = getUIElements();
-        if (!fab) return;
-        fab.classList.remove('ds-loading');
-        fab.classList.add('ds-turbo-spin');
-        fab.innerHTML = '⚡';
-
-        // 安全保底：最多旋转 6 秒后必定恢复，绝不卡死在旋转态
-        if (turboSafetyTimer) clearTimeout(turboSafetyTimer);
-        turboSafetyTimer = setTimeout(stopTurboSpinEffect, 6000);
+        const { fab, sweepBtn } = getUIElements();
+        if (fab) {
+            fab.classList.remove('ds-loading');
+            fab.classList.add('ds-turbo-spin');
+            fab.innerHTML = '⚡';
+        }
+        if (sweepBtn) {
+            sweepBtn.innerText = '⏹️ 停止全卷连刷';
+        }
     }
 
     function stopTurboSpinEffect() {
-        if (turboSafetyTimer) {
-            clearTimeout(turboSafetyTimer);
-            turboSafetyTimer = null;
+        const { fab, sweepBtn } = getUIElements();
+        if (fab) {
+            fab.classList.remove('ds-turbo-spin');
+            fab.classList.remove('ds-loading');
+            fab.innerHTML = '🎯';
         }
-        const { fab } = getUIElements();
-        if (!fab) return;
-        fab.classList.remove('ds-turbo-spin');
-        fab.classList.remove('ds-loading');
-        fab.innerHTML = '🎯';
+        if (sweepBtn) {
+            sweepBtn.innerText = '🚀 全卷从头到尾自动全选';
+        }
     }
 
-    // 跨容器/跨同源 iframe 强制平滑居中滚动（解决 iPad Safari 下 scrollIntoView 不滚动外层窗口或滚动容器的问题）
-    function smoothScrollElementToCenter(el, callback) {
-        if (!el) {
-            if (callback) callback();
-            return;
-        }
+    function sleep(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
 
-        try {
-            // 1. 计算元素相对于顶层视口 (window.top) 的真实坐标偏移
-            let totalTopOffset = 0;
-            let currWin = el.ownerDocument.defaultView || window;
-            const rectInOwnWin = el.getBoundingClientRect();
-            totalTopOffset += rectInOwnWin.top + rectInOwnWin.height / 2;
-
-            while (currWin && currWin !== window.top) {
-                try {
-                    const frameEl = currWin.frameElement;
-                    if (frameEl) {
-                        const fr = frameEl.getBoundingClientRect();
-                        totalTopOffset += fr.top;
-                        currWin = currWin.parent;
-                    } else {
-                        break;
-                    }
-                } catch (_) {
-                    break;
-                }
-            }
-
-            // 目标位置：将元素滚到屏幕偏上 38% 的黄金视觉与操作中心（避开底部浮窗卡片）
-            const targetViewportY = window.top.innerHeight * 0.38;
-            const deltaY = totalTopOffset - targetViewportY;
-
-            // 2. 收集所有可滚动的祖先容器（含内部 overflow:auto/scroll 容器、当前文档与顶层窗口）
-            const scrollTargets = [];
-            let node = el.parentElement;
-            while (node && node !== el.ownerDocument.body && node !== el.ownerDocument.documentElement) {
-                const style = (el.ownerDocument.defaultView || window).getComputedStyle(node);
-                if (/(auto|scroll|overlay)/i.test(style.overflowY + style.overflow) && node.scrollHeight > node.clientHeight + 10) {
-                    scrollTargets.push({ type: 'element', target: node, start: node.scrollTop });
-                }
-                node = node.parentElement;
-            }
-
-            const ownScrollEl = el.ownerDocument.scrollingElement || el.ownerDocument.documentElement || el.ownerDocument.body;
-            if (ownScrollEl && ownScrollEl.scrollHeight > ownScrollEl.clientHeight + 10) {
-                scrollTargets.push({ type: 'element', target: ownScrollEl, start: ownScrollEl.scrollTop });
+    // Promise 版跨容器/跨同源 iframe 强制平滑居中滚屏
+    function smoothScrollToElementAsync(el, duration = 340) {
+        return new Promise((resolve) => {
+            if (!el) {
+                resolve();
+                return;
             }
 
             try {
-                const topScrollEl = window.top.document.scrollingElement || window.top.document.documentElement || window.top.document.body;
-                if (topScrollEl && !scrollTargets.some(s => s.target === topScrollEl)) {
-                    scrollTargets.push({ type: 'window', target: window.top, start: window.top.scrollY || topScrollEl.scrollTop || 0 });
-                }
-            } catch (_) {}
+                let totalTopOffset = 0;
+                let currWin = el.ownerDocument.defaultView || window;
+                const rectInOwnWin = el.getBoundingClientRect();
+                totalTopOffset += rectInOwnWin.top + rectInOwnWin.height / 2;
 
-            // 3. 使用 requestAnimationFrame 执行 340ms 丝滑阻尼滚屏动画
-            if (Math.abs(deltaY) > 12 && scrollTargets.length > 0) {
-                const duration = 340;
-                const startTime = performance.now();
-
-                const step = (now) => {
-                    const progress = Math.min(1, (now - startTime) / duration);
-                    // easeOutCubic 曲线
-                    const eased = 1 - Math.pow(1 - progress, 3);
-
-                    for (const item of scrollTargets) {
-                        if (item.type === 'element') {
-                            item.target.scrollTop = item.start + deltaY * eased;
-                        } else if (item.type === 'window') {
-                            item.target.scrollTo(0, item.start + deltaY * eased);
+                while (currWin && currWin !== window.top) {
+                    try {
+                        const frameEl = currWin.frameElement;
+                        if (frameEl) {
+                            const fr = frameEl.getBoundingClientRect();
+                            totalTopOffset += fr.top;
+                            currWin = currWin.parent;
+                        } else {
+                            break;
                         }
+                    } catch (_) {
+                        break;
                     }
-
-                    if (progress < 1) {
-                        requestAnimationFrame(step);
-                    } else if (callback) {
-                        callback();
-                    }
-                };
-                requestAnimationFrame(step);
-                return;
-            }
-        } catch (err) {
-            console.warn('[DeepSeek Scroll]', err);
-        }
-
-        // 兜底原生平滑滚动
-        try {
-            el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        } catch (_) {}
-        setTimeout(() => {
-            if (callback) callback();
-        }, 320);
-    }
-
-    // 检查学习通/U校园的某个选项是否已经处于被选中状态（防止多选题或重复点击导致取消选中）
-    function isOptionAlreadySelected(optionEl) {
-        if (!optionEl) return false;
-        const checkContainer = optionEl.closest('li, .answerBg, .ant-radio-wrapper, .ant-checkbox-wrapper') || optionEl;
-        if (checkContainer.querySelector('input:checked')) return true;
-        if (checkContainer.querySelector('.check_answer, .check_answer_dx, .ant-radio-checked, .ant-checkbox-checked, .is-checked')) return true;
-        if (/\b(check_answer|check_answer_dx|checked|selected|active|cur|on)\b/i.test(checkContainer.className)) return true;
-        return false;
-    }
-
-    // 零报错真实点击引擎：专为学习通 (mooc1.chaoxing.com) 与 U校园设计
-    // 注意：绝不向 MouseEvent 传入油猴沙箱的 Proxy window (view: window)，否则 WebKit 会抛 TypeError 中断点击！
-    function simulateRealOptionClick(optionEl) {
-        if (!optionEl) return;
-
-        try {
-            // 收集学习通与通用题库中可能绑定了 onclick / addChoice(this) 的候选节点（从内到外）
-            const parentRow = optionEl.closest('.answerBg, .single_choice li, .multi_choice li, .true_false li, .answerList li, .clearfix, li') || optionEl;
-            const clickCandidates = [
-                parentRow.querySelector('input[type="radio"], input[type="checkbox"], .ant-radio-input, .ant-checkbox-input'),
-                parentRow.querySelector('.num_option, .num_option_dx, .ans-radio, .ans-checkbox, [class*="option-icon"], span[data]'),
-                parentRow.querySelector('.answer_p, a, label, p'),
-                optionEl,
-                parentRow
-            ].filter(Boolean);
-
-            // 去重
-            const uniqueTargets = Array.from(new Set(clickCandidates));
-
-            const dispatchCleanClick = (node) => {
-                if (!node) return;
-                const rect = node.getBoundingClientRect();
-                const cx = rect.left + rect.width / 2;
-                const cy = rect.top + rect.height / 2;
-
-                // 不传 view 属性，完美避开 Tampermonkey 沙箱 Proxy Window 类型校验异常
-                const evtOpts = { bubbles: true, cancelable: true, clientX: cx, clientY: cy };
-                try { node.dispatchEvent(new MouseEvent('mousedown', evtOpts)); } catch (_) {}
-                try { node.dispatchEvent(new MouseEvent('mouseup', evtOpts)); } catch (_) {}
-                try { node.click(); } catch (_) {}
-            };
-
-            // 1. 先点击最核心的目标节点（事件会自动向上冒泡触发父级的 onclick="addChoice(this)"）
-            dispatchCleanClick(uniqueTargets[0]);
-
-            // 2. 40ms 后检查是否已成功变为蓝色选中态；若网页把事件绑在其它兄弟或外层节点上，则依次补点直至选中！
-            setTimeout(() => {
-                for (let i = 1; i < uniqueTargets.length; i++) {
-                    if (isOptionAlreadySelected(parentRow)) break;
-                    dispatchCleanClick(uniqueTargets[i]);
                 }
-            }, 40);
 
-            parentRow.classList.add('ds-auto-clicked-pulse');
+                // 将当前题目/选项滚到屏幕偏上 36% 处（避开右下角卡片遮挡）
+                const targetViewportY = window.top.innerHeight * 0.36;
+                const deltaY = totalTopOffset - targetViewportY;
+
+                const scrollTargets = [];
+                let node = el.parentElement;
+                while (node && node !== el.ownerDocument.body && node !== el.ownerDocument.documentElement) {
+                    const style = (el.ownerDocument.defaultView || window).getComputedStyle(node);
+                    if (/(auto|scroll|overlay)/i.test(style.overflowY + style.overflow) && node.scrollHeight > node.clientHeight + 10) {
+                        scrollTargets.push({ type: 'element', target: node, start: node.scrollTop });
+                    }
+                    node = node.parentElement;
+                }
+
+                const ownScrollEl = el.ownerDocument.scrollingElement || el.ownerDocument.documentElement || el.ownerDocument.body;
+                if (ownScrollEl && ownScrollEl.scrollHeight > ownScrollEl.clientHeight + 10) {
+                    scrollTargets.push({ type: 'element', target: ownScrollEl, start: ownScrollEl.scrollTop });
+                }
+
+                try {
+                    const topScrollEl = window.top.document.scrollingElement || window.top.document.documentElement || window.top.document.body;
+                    if (topScrollEl && !scrollTargets.some(s => s.target === topScrollEl)) {
+                        scrollTargets.push({ type: 'window', target: window.top, start: window.top.scrollY || topScrollEl.scrollTop || 0 });
+                    }
+                } catch (_) {}
+
+                if (Math.abs(deltaY) > 10 && scrollTargets.length > 0) {
+                    const startTime = performance.now();
+                    const step = (now) => {
+                        const progress = Math.min(1, (now - startTime) / duration);
+                        const eased = 1 - Math.pow(1 - progress, 3);
+
+                        for (const item of scrollTargets) {
+                            if (item.type === 'element') {
+                                item.target.scrollTop = item.start + deltaY * eased;
+                            } else if (item.type === 'window') {
+                                item.target.scrollTo(0, item.start + deltaY * eased);
+                            }
+                        }
+
+                        if (progress < 1) {
+                            requestAnimationFrame(step);
+                        } else {
+                            resolve();
+                        }
+                    };
+                    requestAnimationFrame(step);
+                    return;
+                }
+            } catch (err) {
+                console.warn('[DeepSeek Scroll]', err);
+            }
+
+            try {
+                el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            } catch (_) {}
+            setTimeout(resolve, duration);
+        });
+    }
+
+    // 通过页面主环境桥接器 + 沙箱双保险点击选项
+    function clickOptionElementReliably(optionEl) {
+        if (!optionEl) return;
+        try {
+            // 确保该文档已注入主环境桥接脚本
+            const ownerDoc = optionEl.ownerDocument || document;
+            if (!ownerDoc.getElementById('ds-mainworld-bridge')) {
+                const s = ownerDoc.createElement('script');
+                s.id = 'ds-mainworld-bridge';
+                s.textContent = document.getElementById('ds-mainworld-bridge')?.textContent || '';
+                (ownerDoc.head || ownerDoc.documentElement).appendChild(s);
+            }
+
+            // 1. 触发主环境桥接点击（支持学习通 jQuery/Zepto 与内联 onclick="addChoice(this)"）
+            optionEl.setAttribute('data-ds-click-target', '1');
+            (ownerDoc.defaultView || window).dispatchEvent(new CustomEvent('ds-mainworld-click'));
+
+            // 2. 沙箱兜底点击
+            const parentRow = optionEl.closest('.answerBg, .single_choice li, .multi_choice li, .true_false li, .answerList li, .ant-radio-wrapper, .ant-checkbox-wrapper, li') || optionEl;
+            parentRow.classList.add('ds-correct-highlight', 'ds-auto-clicked-pulse');
             setTimeout(() => {
                 parentRow.classList.remove('ds-auto-clicked-pulse');
-            }, 1200);
+            }, 1100);
         } catch (err) {
-            console.error('[DeepSeek AutoClick]', err);
+            console.error('[DeepSeek Click]', err);
         }
-    }
-
-    // 执行“平滑滚屏居中 + 自动点击正确选项（或自动填入）”
-    function performScrollAndAutoClick(resultData) {
-        if (!resultData) {
-            stopTurboSpinEffect();
-            return;
-        }
-
-        resultData.autoClicked = true;
-        const { matchedOptions, targetInput, answerText, scopeEl } = resultData;
-        if (scopeEl && scopeEl !== document.body) {
-            STATE.lastSolvedScopeEl = scopeEl;
-        }
-
-        // 情况 A：选择题（单选或多选） -> 平滑滚屏居中并自动点击
-        if (matchedOptions && matchedOptions.length > 0) {
-            matchedOptions.forEach((optObj, idx) => {
-                setTimeout(() => {
-                    const el = optObj.el;
-                    if (!el) {
-                        if (idx === matchedOptions.length - 1) stopTurboSpinEffect();
-                        return;
-                    }
-
-                    smoothScrollElementToCenter(el, () => {
-                        setTimeout(() => {
-                            simulateRealOptionClick(el);
-                            if (idx === matchedOptions.length - 1) {
-                                const { contentBox } = getUIElements();
-                                const statusLabel = contentBox?.querySelector('.ds-answer-box div:first-child');
-                                if (statusLabel) {
-                                    statusLabel.innerHTML = '⚡ <b style="color:#10b981;">已滚屏并自动点选正确项</b>（再次长按 🎯 自动做下一题）';
-                                }
-                                setTimeout(stopTurboSpinEffect, 280);
-                            }
-                        }, 120);
-                    });
-                }, idx * 550);
-            });
-            return;
-        }
-
-        // 情况 B：填空题 / 翻译题 / 简答题 -> 平滑滚屏居中并自动填入答案
-        if (targetInput && answerText) {
-            smoothScrollElementToCenter(targetInput, () => {
-                setTimeout(() => {
-                    targetInput.focus();
-                    setNativeInputValue(targetInput, answerText);
-                    targetInput.classList.add('ds-correct-highlight', 'ds-auto-clicked-pulse');
-                    setTimeout(() => {
-                        targetInput.classList.remove('ds-auto-clicked-pulse');
-                        stopTurboSpinEffect();
-                    }, 450);
-                }, 120);
-            });
-            return;
-        }
-
-        stopTurboSpinEffect();
-    }
-
-    // 查找页面上的“下一道题目”（支持长按悬浮球一路往下自动滚屏连刷！）
-    function findNextQuestionScopeOnPage() {
-        const allQuestionBlocks = querySelectorAllDeep(STRICT_QUESTION_BLOCK_SELECTORS.join(',')).filter(el => {
-            const r = el.getBoundingClientRect();
-            if (r.width < 120 || r.height < 30 || r.height > window.innerHeight * 1.5) return false;
-            // 过滤掉嵌套父容器，只保留最内层的独立题块（如学习通的每个 .TiMu / .singleQuesId）
-            const hasChildQuestion = Array.from(el.children).some(ch =>
-                STRICT_QUESTION_BLOCK_SELECTORS.some(sel => {
-                    try { return ch.matches && ch.matches(sel); } catch (_) { return false; }
-                })
-            );
-            return !hasChildQuestion;
-        });
-
-        if (allQuestionBlocks.length === 0) return null;
-
-        // 1. 如果已有上一道刚完成的题块 lastSolvedScopeEl，直接找排在它后面的下一道题！
-        if (STATE.lastSolvedScopeEl) {
-            const lastIdx = allQuestionBlocks.indexOf(STATE.lastSolvedScopeEl);
-            if (lastIdx !== -1 && lastIdx + 1 < allQuestionBlocks.length) {
-                return allQuestionBlocks[lastIdx + 1];
-            }
-            // 或者按页面纵向坐标找在它下方的第一道题
-            const lastRect = STATE.lastSolvedScopeEl.getBoundingClientRect();
-            const nextBelow = allQuestionBlocks.find(el => el !== STATE.lastSolvedScopeEl && el.getBoundingClientRect().top > lastRect.top + 25);
-            if (nextBelow) return nextBelow;
-        }
-
-        // 2. 否则，优先找当前视口内第一道“尚未作答”的题目，或视口最上方的第一道题
-        const inViewBlocks = allQuestionBlocks.filter(el => {
-            const r = el.getBoundingClientRect();
-            return r.bottom > 60 && r.top < window.innerHeight - 40;
-        });
-
-        const unansweredInView = inViewBlocks.find(el => !isOptionAlreadySelected(el));
-        return unansweredInView || inViewBlocks[0] || allQuestionBlocks[0];
-    }
-
-    // 长按悬浮球主入口
-    function handleLongPressTurboAction() {
-        startTurboSpinEffect();
-        const { card } = getUIElements();
-        if (card) card.style.display = 'block';
-
-        // 情况 1：如果刚才已经轻点解析出了某道题的答案（例如截图中的第1题 C 常规集装箱），且还没自动点选过它：
-        // 立即滚屏居中这道题的正确选项并自动点击它！
-        if (
-            STATE.lastResultData &&
-            !STATE.lastResultData.autoClicked &&
-            STATE.lastResultData.timestamp >= STATE.lastTouchTime &&
-            ((STATE.lastResultData.matchedOptions && STATE.lastResultData.matchedOptions.length > 0) ||
-             STATE.lastResultData.targetInput)
-        ) {
-            performScrollAndAutoClick(STATE.lastResultData);
-            return;
-        }
-
-        // 情况 2：如果用户在长按前刚刚用手指点过某道新题，则针对用户刚点的这道题执行“解析 + 滚屏 + 自动点选”
-        if (STATE.lastPickedScope && (!STATE.lastResultData || STATE.lastTouchTime > STATE.lastResultData.timestamp)) {
-            triggerAnalysis({ explicitScope: null, autoExecute: true });
-            return;
-        }
-
-        // 情况 3：如果上一道题已经自动点选过了（或刚打开页面直接长按），自动寻找页面上的下一道题目，先平滑滚屏过去，再解析并自动点选！
-        const nextScope = findNextQuestionScopeOnPage();
-        if (nextScope) {
-            STATE.lastSolvedScopeEl = nextScope;
-            smoothScrollElementToCenter(nextScope, () => {
-                triggerAnalysis({ explicitScope: nextScope, autoExecute: true });
-            });
-            return;
-        }
-
-        triggerAnalysis({ explicitScope: null, autoExecute: true });
     }
 
     /********************************************************************
-     * 5. 快捷键监听 (Mac / iPad 妙控键盘 / Win 兼容)
+     * 6. 全卷题目扫描器：自动识别页面从第 1 题到最后一题的所有题目块
      ********************************************************************/
-    window.addEventListener('keydown', (e) => {
-        const isShortcutMod = e.altKey || (IS_MAC && e.ctrlKey && !e.metaKey);
-
-        if (e.code === 'Escape') {
-            if (STATE.pickerMode) {
-                togglePickerMode(false);
-                return;
-            }
-            const { card } = getUIElements();
-            if (card && card.style.display !== 'none') {
-                card.style.display = 'none';
-                return;
-            }
-        }
-
-        if (isShortcutMod && e.code === 'KeyQ') {
-            e.preventDefault();
-            triggerAnalysis({ autoExecute: false });
-            return;
-        }
-
-        if (isShortcutMod && e.code === 'KeyW') {
-            e.preventDefault();
-            handleLongPressTurboAction();
-            return;
-        }
-
-        if (isShortcutMod && e.code === 'KeyS') {
-            e.preventDefault();
-            togglePickerMode();
-            return;
-        }
-    });
-
-    /********************************************************************
-     * 6. 核心选题算法：学习通 (mooc1.chaoxing.com) + U校园 + 通用题库
-     ********************************************************************/
-    function isEditable(el) {
-        if (!el) return false;
-        const tag = el.tagName;
-        return tag === 'INPUT' || tag === 'TEXTAREA' || el.isContentEditable ||
-               el.getAttribute?.('role') === 'textbox' || el.classList?.contains('edui-body-container');
-    }
-
-    // 严格的单题外层容器选择器（用于自动寻找下一题）
     const STRICT_QUESTION_BLOCK_SELECTORS = [
-        '.TiMu', '.singleQuesId', '.questionLi', '.question-common-abs-reply', '.question-inputbox',
+        '.TiMu', '.singleQuesId', '.questionLi',
+        '.question-common-abs-reply', '.question-inputbox',
         '.question-item', '.question-box', '.question-card', '.exam-item',
         '.subject-item', '.q-item', '.ti-item', '.problem-item',
         '[class*="question-wrapper"]', '[class*="question-container"]', '[class*="exercise-item"]'
     ];
 
-    const CONTAINER_SELECTORS = [
-        ...STRICT_QUESTION_BLOCK_SELECTORS,
-        '.padBom50', '.font-cxsecret',
-        '[class*="question"]', '[class*="subject"]', '[class*="topic"]',
-        'fieldset', 'article', 'li'
-    ];
-
     const OPTION_SELECTORS = [
-        // 学习通 (mooc1.chaoxing.com) 专属选项行
         '.answerBg', '.single_choice li', '.multi_choice li', '.true_false li', '.answerList li', '.marBom6', '.ul-list li',
-        // U校园 / AntDesign / React
         '.ant-radio-wrapper', '.ant-checkbox-wrapper', '[class*="radio-item"]', '[class*="checkbox-item"]',
         '[class*="option-wrap"]', '[class*="option-item"]', '[class*="optionItem"]', '[class*="choice-item"]',
-        // 通用题库
         '.option', '.options li', '.question-option', '.answer-item',
         '.el-radio', '.el-checkbox', 'label', 'li[role="option"]', 'div[role="radio"]', 'div[role="checkbox"]'
+    ];
+
+    const INPUT_SELECTORS = [
+        'textarea', '[contenteditable="true"]', '[role="textbox"]', '.edui-body-container',
+        'input[type="text"]', 'input:not([type])', 'input[type="search"]', 'input[type="number"]'
     ];
 
     function querySelectorAllDeep(selector, root = document) {
@@ -869,189 +737,28 @@
         return results;
     }
 
-    function extractRichTextWithBlanks(node, targetBlankEl = null) {
-        if (!node) return '';
-        const liveInputs = Array.from(node.querySelectorAll ? node.querySelectorAll('input, textarea, [contenteditable="true"], .edui-body-container') : []);
-        const cleanupList = [];
+    // 提取某个题块内的所有选项（注意：不限制视口高度，支持提取屏幕下方尚未滚动到的所有题目选项！）
+    function extractOptionsFromBlock(blockEl) {
+        let rawOptions = querySelectorAllDeep(OPTION_SELECTORS.join(','), blockEl);
 
-        liveInputs.forEach((inp) => {
-            if (inp.type === 'hidden' || inp.type === 'radio' || inp.type === 'checkbox') return;
-            const curVal = (inp.isContentEditable ? inp.innerText : inp.value || '').trim();
-            const marker = (targetBlankEl && inp === targetBlankEl)
-                ? (curVal ? ` [[👉当前需要作答的目标空格(已填:"${curVal}")👈]] ` : ` [[👉当前需要作答的目标空格👈]] `)
-                : (curVal ? ` [[空格(已填:"${curVal}")]] ` : ` [[空格(待填)]] `);
-            inp.setAttribute('data-ds-marker', marker);
-            cleanupList.push(inp);
-        });
-
-        const clone = node.cloneNode(true);
-        cleanupList.forEach(inp => inp.removeAttribute('data-ds-marker'));
-
-        clone.querySelectorAll('[data-ds-marker]').forEach(el => {
-            el.replaceWith(el.getAttribute('data-ds-marker'));
-        });
-        clone.querySelectorAll('style, script, .ans-icon, .font-cxsecret-ignore').forEach(el => el.remove());
-
-        return (clone.innerText || clone.textContent || '').replace(/\s+/g, ' ').trim();
-    }
-
-    function findSmartQuestionScope(explicitScope = null) {
-        if (explicitScope) {
-            return {
-                scopeEl: explicitScope,
-                customText: null,
-                targetInput: explicitScope.querySelector?.('input:not([type="hidden"]):not([type="radio"]):not([type="checkbox"]), textarea, [contenteditable="true"]') || null
-            };
-        }
-
-        const selectionText = window.getSelection()?.toString().trim();
-        if (selectionText && selectionText.length >= 2) {
-            return { scopeEl: document.body, customText: selectionText, targetInput: null };
-        }
-
-        const ui = getUIElements();
-        const hitUnderMouse = document.elementFromPoint(STATE.lastMousePos.x, STATE.lastMousePos.y);
-        let curr = (STATE.lastPickedScope && STATE.lastPickedScope.ownerDocument?.body.contains(STATE.lastPickedScope))
-            ? STATE.lastPickedScope
-            : (hitUnderMouse || document.activeElement);
-
-        if (curr && (curr === ui.fab || ui.fab?.contains(curr) || curr === ui.card || ui.card?.contains(curr))) {
-            curr = null;
-        }
-
-        // 若用户尚未点选任何题目，自动取视口中央或第一道题目
-        if (!curr || curr === document.body || curr === document.documentElement) {
-            const firstScope = findNextQuestionScopeOnPage();
-            if (firstScope) {
-                return {
-                    scopeEl: firstScope,
-                    customText: null,
-                    targetInput: firstScope.querySelector?.('input:not([type="hidden"]):not([type="radio"]):not([type="checkbox"]), textarea, [contenteditable="true"]') || null
-                };
+        // 启发式兜底：若网页没有标准类名，扫描以 A/B/C/D 开头的并列选项行
+        if (rawOptions.length === 0) {
+            const optionPrefixRegex = /^\s*([A-H]([.、．:：\s)]|$)|[（(][A-H][)）])/i;
+            const nodes = querySelectorAllDeep('li, div, p, label', blockEl);
+            for (const n of nodes) {
+                if (n.children.length > 6) continue;
+                const txt = (n.innerText || '').replace(/\s+/g, ' ').trim();
+                if (txt.length >= 1 && txt.length <= 240 && optionPrefixRegex.test(txt)) {
+                    rawOptions.push(n);
+                }
             }
-            curr = document.body;
-        }
-
-        let targetInput = null;
-        if (isEditable(curr)) {
-            targetInput = curr;
-        }
-
-        const unipusReply = curr?.closest?.('.question-common-abs-reply, .question-inputbox');
-        if (unipusReply) {
-            return {
-                scopeEl: unipusReply,
-                customText: null,
-                targetInput: targetInput || unipusReply.querySelector('textarea, input, [contenteditable="true"]')
-            };
-        }
-
-        let depth = 0;
-        let bestScope = curr;
-        while (curr && curr !== curr.ownerDocument?.body && depth < 12) {
-            const isMatchedContainer = CONTAINER_SELECTORS.some(sel => {
-                try { return curr.matches && curr.matches(sel); } catch (_) { return false; }
-            });
-
-            const inputs = Array.from(curr.querySelectorAll('input:not([type="hidden"]):not([type="radio"]):not([type="checkbox"]), textarea, [contenteditable="true"]'));
-            const options = Array.from(curr.querySelectorAll(OPTION_SELECTORS.join(',')));
-
-            if (!targetInput && inputs.length > 0) {
-                targetInput = inputs[0];
-            }
-
-            if (isMatchedContainer || (inputs.length === 1 && (curr.innerText || '').length >= 6) || (options.length >= 2 && options.length <= 8)) {
-                bestScope = curr;
-                break;
-            }
-            curr = curr.parentElement;
-            depth++;
-        }
-
-        return {
-            scopeEl: bestScope || document.body,
-            customText: null,
-            targetInput
-        };
-    }
-
-    function togglePickerMode(forceState) {
-        STATE.pickerMode = typeof forceState === 'boolean' ? forceState : !STATE.pickerMode;
-        if (!STATE.pickerMode) {
-            if (STATE.hoveredPickerEl) {
-                STATE.hoveredPickerEl.classList.remove('ds-picker-highlight');
-                STATE.hoveredPickerEl = null;
-            }
-        } else {
-            updatePickerHighlight(STATE.lastMousePos.x, STATE.lastMousePos.y);
-        }
-    }
-
-    function updatePickerHighlight(x, y) {
-        if (!STATE.pickerMode) return;
-        const ui = getUIElements();
-        const hit = document.elementFromPoint(x, y);
-        if (!hit || hit === ui.fab || hit === ui.card || ui.card?.contains(hit)) return;
-
-        let scope = hit;
-        let depth = 0;
-        while (scope && scope !== document.body && depth < 8) {
-            const r = scope.getBoundingClientRect();
-            if (r.width > 120 && r.height > 24 && r.height < window.innerHeight * 0.8) {
-                break;
-            }
-            scope = scope.parentElement;
-            depth++;
-        }
-
-        if (scope && scope !== STATE.hoveredPickerEl) {
-            if (STATE.hoveredPickerEl) {
-                STATE.hoveredPickerEl.classList.remove('ds-picker-highlight');
-            }
-            STATE.hoveredPickerEl = scope;
-            STATE.hoveredPickerEl.classList.add('ds-picker-highlight');
-        }
-    }
-
-    function flashScope(el) {
-        if (!el || el === document.body) return;
-        el.classList.add('ds-scope-flash');
-        setTimeout(() => el.classList.remove('ds-scope-flash'), 800);
-    }
-
-    /********************************************************************
-     * 7. API 解析与浮窗结果呈现（支持 autoExecute 长按自动滚屏点选）
-     ********************************************************************/
-    function triggerAnalysis({ explicitScope = null, autoExecute = false } = {}) {
-        const ui = getUIElements();
-        if (!STATE.apiKey) {
-            stopTurboSpinEffect();
-            const key = prompt('请输入您的 DeepSeek API Key (sk-...):', '');
-            if (key) {
-                STATE.apiKey = key.trim();
-                GM_setValue('DEEPSEEK_API_KEY', STATE.apiKey);
-            } else {
-                return;
-            }
-        }
-
-        if (STATE.isAnalyzing) return;
-
-        const { scopeEl, customText, targetInput } = findSmartQuestionScope(explicitScope);
-        flashScope(scopeEl);
-
-        const questionText = customText || extractRichTextWithBlanks(scopeEl, targetInput);
-
-        let rawOptions = querySelectorAllDeep(OPTION_SELECTORS.join(','), scopeEl);
-        if (rawOptions.length === 0 && scopeEl === document.body) {
-            rawOptions = querySelectorAllDeep(OPTION_SELECTORS.join(','), document);
         }
 
         const options = [];
         const seenTexts = new Set();
         for (const el of rawOptions) {
             const r = el.getBoundingClientRect();
-            if (r.width < 16 || r.height < 12) continue;
+            if (r.width < 12 || r.height < 10 || r.height > 280) continue;
             const t = (el.innerText || '').replace(/\s+/g, ' ').trim();
             if (t.length >= 1 && t.length <= 260 && !seenTexts.has(t)) {
                 const isParent = rawOptions.some(other => other !== el && el.contains(other));
@@ -1062,203 +769,456 @@
             }
             if (options.length >= 10) break;
         }
+        return options;
+    }
 
+    function extractInputsFromBlock(blockEl) {
+        const rawInputs = querySelectorAllDeep(INPUT_SELECTORS.join(','), blockEl);
+        return rawInputs.filter(el => {
+            if (el.disabled || el.readOnly) return false;
+            if (el.type === 'hidden' || el.type === 'radio' || el.type === 'checkbox') return false;
+            const r = el.getBoundingClientRect();
+            return r.width >= 16 && r.height >= 12;
+        });
+    }
+
+    function extractCleanQuestionText(blockEl, targetInput = null) {
+        if (!blockEl) return '';
+        const liveInputs = Array.from(blockEl.querySelectorAll ? blockEl.querySelectorAll('input, textarea, [contenteditable="true"]') : []);
+        const cleanupList = [];
+
+        liveInputs.forEach((inp) => {
+            if (inp.type === 'hidden' || inp.type === 'radio' || inp.type === 'checkbox') return;
+            const curVal = (inp.isContentEditable ? inp.innerText : inp.value || '').trim();
+            const marker = (targetInput && inp === targetInput)
+                ? ` [[👉目标填空空格👈]] `
+                : (curVal ? ` [[空格(已填:"${curVal}")]] ` : ` [[空格]] `);
+            inp.setAttribute('data-ds-marker', marker);
+            cleanupList.push(inp);
+        });
+
+        const clone = blockEl.cloneNode(true);
+        cleanupList.forEach(inp => inp.removeAttribute('data-ds-marker'));
+        clone.querySelectorAll('[data-ds-marker]').forEach(el => el.replaceWith(el.getAttribute('data-ds-marker')));
+        clone.querySelectorAll('style, script, .ans-icon, .font-cxsecret-ignore').forEach(el => el.remove());
+
+        return (clone.innerText || clone.textContent || '').replace(/\s+/g, ' ').trim();
+    }
+
+    // 扫描整张页面（含未滚入视口的下方区域），按从上到下顺序返回所有独立题目对象
+    function collectAllQuestionsOnPage() {
+        let blocks = querySelectorAllDeep(STRICT_QUESTION_BLOCK_SELECTORS.join(','));
+
+        // 过滤掉无效容器或包裹了多道子题目的外层大容器
+        let validBlocks = blocks.filter(el => {
+            const r = el.getBoundingClientRect();
+            if (r.width < 100 || r.height < 24) return false;
+            const opts = extractOptionsFromBlock(el);
+            const inps = extractInputsFromBlock(el);
+            return opts.length >= 2 || inps.length >= 1;
+        });
+
+        // 剔除包含其它 validBlock 的父级容器，只保留最内层的单道题目块
+        validBlocks = validBlocks.filter(el => !validBlocks.some(other => other !== el && el.contains(other)));
+
+        // 启发式兜底：若页面没有标准题目容器类名，则从所有选项出发向上聚类找各自的题块父节点
+        if (validBlocks.length === 0) {
+            const allOpts = querySelectorAllDeep(OPTION_SELECTORS.join(','));
+            const discovered = new Set();
+            for (const opt of allOpts) {
+                let curr = opt.parentElement;
+                let depth = 0;
+                while (curr && curr !== document.body && depth < 7) {
+                    const optsInCurr = extractOptionsFromBlock(curr);
+                    const txtLen = (curr.innerText || '').trim().length;
+                    if (optsInCurr.length >= 2 && optsInCurr.length <= 8 && txtLen > optsInCurr.reduce((s, o) => s + o.text.length, 0) + 6) {
+                        discovered.add(curr);
+                        break;
+                    }
+                    curr = curr.parentElement;
+                    depth++;
+                }
+            }
+            validBlocks = Array.from(discovered).filter(el => !Array.from(discovered).some(other => other !== el && el.contains(other)));
+        }
+
+        // 按页面从上到下的绝对纵向位置排序
+        validBlocks.sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
+
+        return validBlocks.map((blockEl, index) => {
+            const options = extractOptionsFromBlock(blockEl);
+            const inputs = extractInputsFromBlock(blockEl);
+            const stemText = extractCleanQuestionText(blockEl, inputs[0] || null).slice(0, 900);
+            return {
+                index,
+                blockEl,
+                options,
+                inputs,
+                stemText
+            };
+        });
+    }
+
+    /********************************************************************
+     * 7. 全卷从头到尾自动滚屏全选引擎 (Batch Prefetch + Sequential Scroll & Click)
+     ********************************************************************/
+    function requestDeepSeekBatchAnalysis(questionBatch) {
+        return new Promise((resolve) => {
+            const batchPromptItems = questionBatch.map((q, idx) => {
+                const optsStr = q.options.length > 0
+                    ? q.options.map((o, i) => `  [${i}] ${o.text}`).join('\n')
+                    : '  （填空/主观题，无选项）';
+                return `【第 ${idx} 题】：\n题干与内容：${q.stemText}\n候选选项：\n${optsStr}`;
+            }).join('\n\n----------------\n\n');
+
+            const systemPrompt = [
+                '你是一个高精度的在线题库全卷批量解析引擎。',
+                '请针对用户提供的每道题目，准确判断正确答案，并严格返回如下 JSON 格式（不要包含任何 Markdown 代码块标签）：',
+                '{',
+                '  "results": [',
+                '    { "qIdx": 0, "bestIndices": [正确选项数字编号数组，单选如[2]，多选如[0,2]], "answer": "正确选项或填空文本", "reason": "简短理由" }',
+                '  ]',
+                '}'
+            ].join('\n');
+
+            const payload = {
+                model: STATE.model,
+                messages: [
+                    { role: 'system', content: systemPrompt },
+                    { role: 'user', content: batchPromptItems }
+                ]
+            };
+            if (STATE.model === 'deepseek-chat') {
+                payload.temperature = 0.1;
+                payload.response_format = { type: 'json_object' };
+            }
+
+            GM_xmlhttpRequest({
+                method: 'POST',
+                url: CONFIG.apiUrl,
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${STATE.apiKey}`
+                },
+                data: JSON.stringify(payload),
+                onload: (res) => {
+                    try {
+                        if (res.status !== 200) {
+                            resolve({});
+                            return;
+                        }
+                        const data = JSON.parse(res.responseText);
+                        const rawContent = data.choices?.[0]?.message?.content || '{}';
+                        const cleaned = rawContent.replace(/```json|```/gi, '').trim();
+                        const firstBrace = cleaned.indexOf('{');
+                        const lastBrace = cleaned.lastIndexOf('}');
+                        const parsed = JSON.parse(firstBrace !== -1 ? cleaned.slice(firstBrace, lastBrace + 1) : cleaned);
+                        const map = {};
+                        if (Array.isArray(parsed.results)) {
+                            parsed.results.forEach((item, i) => {
+                                const key = item.qIdx !== undefined ? Number(item.qIdx) : i;
+                                map[key] = item;
+                            });
+                        }
+                        resolve(map);
+                    } catch (e) {
+                        console.error('[DeepSeek Batch Parse]', e);
+                        resolve({});
+                    }
+                },
+                onerror: () => resolve({})
+            });
+        });
+    }
+
+    async function startFullPageAutoSweep() {
+        const ui = getUIElements();
+        if (!STATE.apiKey) {
+            const key = prompt('请输入您的 DeepSeek API Key (sk-...):', '');
+            if (key) {
+                STATE.apiKey = key.trim();
+                GM_setValue('DEEPSEEK_API_KEY', STATE.apiKey);
+            } else {
+                return;
+            }
+        }
+
+        if (STATE.isBatchRunning) return;
+
+        const allQuestions = collectAllQuestionsOnPage();
+        if (allQuestions.length === 0) {
+            if (ui.card) ui.card.style.display = 'block';
+            if (ui.contentBox) {
+                ui.contentBox.innerHTML = `<div style="color:#f59e0b;">⚠️ 未在当前页面扫描到题目列表，请确认题目已加载完毕。</div>`;
+            }
+            return;
+        }
+
+        STATE.isBatchRunning = true;
+        STATE.stopBatchRequested = false;
+        startTurboSpinEffect();
         if (ui.card) ui.card.style.display = 'block';
-        if (ui.footerBox) ui.footerBox.style.display = 'none';
+
+        const total = allQuestions.length;
+        let completedCount = 0;
+
+        const updateSweepProgressUI = (curIdx, titlePreview, answerPreview, statusNote) => {
+            if (!ui.contentBox) return;
+            const pct = Math.round((curIdx / total) * 100);
+            ui.contentBox.innerHTML = `
+                <div style="display:flex;justify-content:space-between;align-items:center;color:#10b981;font-weight:600;">
+                    <span>⚡ 全卷自动滚屏全选中 (${curIdx}/${total})</span>
+                    <span style="font-size:11px;color:#94a3b8;">轻点 ⚡ 可随时暂停</span>
+                </div>
+                <div class="ds-progress-bar-bg">
+                    <div class="ds-progress-bar-fill" style="width:${pct}%;"></div>
+                </div>
+                <div class="ds-answer-box" style="margin-top:6px;margin-bottom:2px;">
+                    <div style="font-size:11px;color:#94a3b8;">当前第 ${curIdx} 题：${escapeHtml(titlePreview.slice(0, 26))}...</div>
+                    <div class="ds-answer-main">${escapeHtml(answerPreview || '正在解析...')}</div>
+                    ${statusNote ? `<div class="ds-answer-sub">${escapeHtml(statusNote)}</div>` : ''}
+                </div>
+            `;
+        };
+
+        // 按每批 CONFIG.batchSize (4道题) 切片：一边在后台并发拿到这4道题的答案，一边在前台逐题丝滑滚动屏幕并点选！
+        for (let startIdx = 0; startIdx < total; startIdx += CONFIG.batchSize) {
+            if (STATE.stopBatchRequested) break;
+
+            const batch = allQuestions.slice(startIdx, startIdx + CONFIG.batchSize);
+
+            // 先平滑滚动到本批次的第 1 道题，同时发起本批次 4 道题的 DeepSeek 请求
+            const firstQ = batch[0];
+            updateSweepProgressUI(startIdx + 1, firstQ.stemText, `⏳ 正在并发解析第 ${startIdx + 1}~${Math.min(total, startIdx + batch.length)} 题...`, '');
+
+            const [batchAnswersMap] = await Promise.all([
+                requestDeepSeekBatchAnalysis(batch),
+                smoothScrollToElementAsync(firstQ.blockEl, 380)
+            ]);
+
+            // 依次滚动到本批次的每一道题并自动点击正确选项！
+            for (let bIdx = 0; bIdx < batch.length; bIdx++) {
+                if (STATE.stopBatchRequested) break;
+
+                const q = batch[bIdx];
+                const globalNum = startIdx + bIdx + 1;
+                const ansObj = batchAnswersMap[bIdx] || {};
+
+                // 滚动屏幕将该题居中并闪烁边框
+                q.blockEl.classList.add('ds-scope-flash');
+                await smoothScrollToElementAsync(q.blockEl, 320);
+
+                const matchedOpts = [];
+                if (q.options.length > 0) {
+                    const indices = Array.isArray(ansObj.bestIndices)
+                        ? ansObj.bestIndices.map(Number).filter(n => !Number.isNaN(n))
+                        : [];
+
+                    for (const i of indices) {
+                        if (q.options[i]) matchedOpts.push(q.options[i]);
+                    }
+
+                    // 文本模糊匹配兜底
+                    if (matchedOpts.length === 0 && ansObj.answer) {
+                        const ansClean = String(ansObj.answer).replace(/^[A-H][.、\s)\]]*/i, '').trim();
+                        const fb = q.options.find(o =>
+                            o.text.includes(ansObj.answer) ||
+                            String(ansObj.answer).includes(o.text) ||
+                            (ansClean.length >= 2 && o.text.includes(ansClean))
+                        );
+                        if (fb) matchedOpts.push(fb);
+                    }
+                }
+
+                // 执行自动点选或自动填空
+                if (matchedOpts.length > 0) {
+                    const ansDisplay = matchedOpts.map(o => o.text).join(' | ');
+                    updateSweepProgressUI(globalNum, q.stemText, `✅ 已选：${ansDisplay}`, ansObj.reason || '');
+
+                    for (const opt of matchedOpts) {
+                        await smoothScrollToElementAsync(opt.el, 220);
+                        clickOptionElementReliably(opt.el);
+                        await sleep(220);
+                    }
+                    completedCount++;
+                } else if (q.inputs.length > 0 && ansObj.answer) {
+                    const inp = q.inputs[0];
+                    updateSweepProgressUI(globalNum, q.stemText, `✍️ 已填：${ansObj.answer}`, ansObj.reason || '');
+                    await smoothScrollToElementAsync(inp, 220);
+                    inp.focus();
+                    setNativeInputValue(inp, String(ansObj.answer).trim());
+                    inp.classList.add('ds-correct-highlight');
+                    completedCount++;
+                } else {
+                    updateSweepProgressUI(globalNum, q.stemText, ansObj.answer || '⚠️ 未匹配到选项', ansObj.reason || '');
+                }
+
+                setTimeout(() => q.blockEl.classList.remove('ds-scope-flash'), 600);
+                await sleep(360);
+            }
+        }
+
+        STATE.isBatchRunning = false;
+        stopTurboSpinEffect();
 
         if (ui.contentBox) {
+            if (STATE.stopBatchRequested) {
+                ui.contentBox.innerHTML = `
+                    <div class="ds-answer-box" style="border-left-color:#f59e0b;">
+                        <div class="ds-answer-main" style="color:#f59e0b;">⏸️ 全卷连刷已手动暂停</div>
+                        <div class="ds-answer-sub">已完成 ${completedCount} / ${total} 题。长按或连点 3 下 🎯 可重新开始。</div>
+                    </div>
+                `;
+            } else {
+                ui.contentBox.innerHTML = `
+                    <div class="ds-answer-box">
+                        <div class="ds-answer-main">🎉 全卷 ${completedCount} / ${total} 题已全部自动选完！</div>
+                        <div class="ds-answer-sub">已从头到尾滚动并完成所有题目点选，请检查确认后提交。</div>
+                    </div>
+                `;
+            }
+        }
+    }
+
+    /********************************************************************
+     * 8. 原有单题解析功能（轻点 1 下悬浮球触发）
+     ********************************************************************/
+    function findSingleQuestionScope() {
+        const ui = getUIElements();
+        const hitUnderMouse = document.elementFromPoint(STATE.lastMousePos.x, STATE.lastMousePos.y);
+        let curr = (STATE.lastPickedScope && STATE.lastPickedScope.ownerDocument?.body.contains(STATE.lastPickedScope))
+            ? STATE.lastPickedScope
+            : (hitUnderMouse || document.activeElement);
+
+        if (curr && (curr === ui.fab || ui.fab?.contains(curr) || curr === ui.card || ui.card?.contains(curr))) {
+            curr = null;
+        }
+
+        if (!curr || curr === document.body) {
+            const allQ = collectAllQuestionsOnPage();
+            const inView = allQ.find(q => {
+                const r = q.blockEl.getBoundingClientRect();
+                return r.bottom > 80 && r.top < window.innerHeight - 60;
+            }) || allQ[0];
+            if (inView) return inView.blockEl;
+            return document.body;
+        }
+
+        let depth = 0;
+        while (curr && curr !== document.body && depth < 12) {
+            const isMatched = STRICT_QUESTION_BLOCK_SELECTORS.some(sel => {
+                try { return curr.matches && curr.matches(sel); } catch (_) { return false; }
+            });
+            const opts = extractOptionsFromBlock(curr);
+            const inps = extractInputsFromBlock(curr);
+            if (isMatched || (opts.length >= 2 && opts.length <= 8) || (inps.length === 1 && (curr.innerText || '').length >= 6)) {
+                return curr;
+            }
+            curr = curr.parentElement;
+            depth++;
+        }
+        return document.body;
+    }
+
+    function triggerSingleQuestionAnalysis() {
+        const ui = getUIElements();
+        if (!STATE.apiKey) {
+            const key = prompt('请输入您的 DeepSeek API Key (sk-...):', '');
+            if (key) {
+                STATE.apiKey = key.trim();
+                GM_setValue('DEEPSEEK_API_KEY', STATE.apiKey);
+            } else {
+                return;
+            }
+        }
+
+        if (STATE.isAnalyzing || STATE.isBatchRunning) return;
+
+        const scopeEl = findSingleQuestionScope();
+        if (scopeEl && scopeEl !== document.body) {
+            scopeEl.classList.add('ds-scope-flash');
+            setTimeout(() => scopeEl.classList.remove('ds-scope-flash'), 700);
+        }
+
+        const options = extractOptionsFromBlock(scopeEl);
+        const inputs = extractInputsFromBlock(scopeEl);
+        const questionText = extractCleanQuestionText(scopeEl, inputs[0] || null).slice(0, 1200);
+
+        if (ui.card) ui.card.style.display = 'block';
+        if (ui.contentBox) {
             ui.contentBox.innerHTML = `
-                <div style="display:flex;align-items:center;gap:8px;color:${autoExecute ? '#10b981' : '#38bdf8'};">
-                    <span>${autoExecute ? '⚡' : '⏳'}</span>
-                    <span>${autoExecute
-                        ? `<b>涡轮自动点选模式</b>：正在解析并自动滚屏点选...`
-                        : `正在使用 <b>${STATE.model === 'deepseek-reasoner' ? 'R1推理' : 'V3'}</b> 解析题目...`}</span>
+                <div style="display:flex;align-items:center;gap:8px;color:#38bdf8;">
+                    <span>⏳</span>
+                    <span>正在解析当前单题 (长按或三击 🎯 可全卷自动连刷)...</span>
                 </div>
-                <div style="font-size:11px;color:#64748b;margin-top:4px;">题目：${escapeHtml(questionText.slice(0, 38))}...</div>
+                <div style="font-size:11px;color:#64748b;margin-top:4px;">题目：${escapeHtml(questionText.slice(0, 36))}...</div>
             `;
         }
-
-        if (autoExecute) {
-            startTurboSpinEffect();
-        } else if (ui.fab) {
-            ui.fab.classList.add('ds-loading');
-        }
-
+        if (ui.fab) ui.fab.classList.add('ds-loading');
         STATE.isAnalyzing = true;
 
-        const systemPrompt = [
-            '你是一个专为 iPad/Mac 学习通(超星尔雅)、U校园等多平台打造的高精度解题助手。',
-            '请直接返回纯净 JSON 格式（不要包含任何 Markdown 代码块标签）：',
-            '{',
-            '  "questionType": "choice" 或 "input" 或 "translate" 或 "essay",',
-            '  "bestIndices": [选项数字编号数组，单选题如 [0]，多选题如 [0, 2]],',
-            '  "answer": "必须选中或填入的最准确答案文本",',
-            '  "altAnswers": ["备选格式1", "备选格式2"],',
-            '  "reason": "1句简短解析或中文翻译"',
-            '}'
-        ].join('\n');
+        requestDeepSeekBatchAnalysis([{ stemText: questionText, options, inputs }]).then((map) => {
+            STATE.isAnalyzing = false;
+            if (ui.fab) ui.fab.classList.remove('ds-loading');
 
-        const userPrompt = [
-            `【题目内容】：\n${questionText}`,
-            options.length > 0 ? `【候选选项】：\n${options.map((o, i) => `[${i}] ${o.text}`).join('\n')}` : '',
-            targetInput ? `【填空输入框当前框内值】："${targetInput.value || ''}"` : ''
-        ].filter(Boolean).join('\n\n');
+            const ansObj = map[0];
+            if (!ansObj) {
+                if (ui.contentBox) ui.contentBox.innerHTML = `<div style="color:#ef4444;">❌ 解析失败，请检查 API Key 或网络</div>`;
+                return;
+            }
 
-        const payload = {
-            model: STATE.model,
-            messages: [
-                { role: 'system', content: systemPrompt },
-                { role: 'user', content: userPrompt }
-            ]
-        };
-        if (STATE.model === 'deepseek-chat') {
-            payload.temperature = 0.1;
-            payload.response_format = { type: 'json_object' };
-        }
+            const matchedOpts = [];
+            if (options.length > 0 && Array.isArray(ansObj.bestIndices)) {
+                ansObj.bestIndices.forEach(idx => {
+                    if (options[Number(idx)]) matchedOpts.push(options[Number(idx)]);
+                });
+            }
+            if (matchedOpts.length === 0 && ansObj.answer && options.length > 0) {
+                const fb = options.find(o => o.text.includes(ansObj.answer) || String(ansObj.answer).includes(o.text));
+                if (fb) matchedOpts.push(fb);
+            }
 
-        GM_xmlhttpRequest({
-            method: 'POST',
-            url: CONFIG.apiUrl,
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${STATE.apiKey}`
-            },
-            data: JSON.stringify(payload),
-            onload: (res) => {
-                STATE.isAnalyzing = false;
-                if (!autoExecute && ui.fab) ui.fab.classList.remove('ds-loading');
-                try {
-                    if (res.status !== 200) {
-                        stopTurboSpinEffect();
-                        if (ui.contentBox) ui.contentBox.innerHTML = `<div style="color:#ef4444;">❌ 请求失败 (HTTP ${res.status})，请检查 API Key</div>`;
-                        return;
+            matchedOpts.forEach(opt => opt.el.classList.add('ds-correct-highlight'));
+            const ansText = ansObj.answer || matchedOpts.map(o => o.text).join(' | ') || '已解析';
+
+            if (ui.contentBox) {
+                ui.contentBox.innerHTML = `
+                    <div class="ds-answer-box">
+                        <div style="font-size:11px;color:#94a3b8;margin-bottom:2px;">单题解析结果（长按或连点3下 🎯 全卷自动选完）</div>
+                        <div class="ds-answer-main">${escapeHtml(ansText)}</div>
+                        ${ansObj.reason ? `<div class="ds-answer-sub">${escapeHtml(ansObj.reason)}</div>` : ''}
+                    </div>
+                `;
+            }
+
+            if (ui.fillBtn) {
+                ui.fillBtn.style.display = (matchedOpts.length > 0 || inputs.length > 0) ? 'inline-flex' : 'none';
+                ui.fillBtn.onclick = async () => {
+                    for (const opt of matchedOpts) {
+                        await smoothScrollToElementAsync(opt.el, 240);
+                        clickOptionElementReliably(opt.el);
                     }
-                    const data = JSON.parse(res.responseText);
-                    const rawContent = data.choices?.[0]?.message?.content || '{}';
-                    const cleaned = rawContent.replace(/```json|```/gi, '').trim();
-                    const firstBrace = cleaned.indexOf('{');
-                    const lastBrace = cleaned.lastIndexOf('}');
-                    const parsed = JSON.parse(firstBrace !== -1 ? cleaned.slice(firstBrace, lastBrace + 1) : cleaned);
-
-                    renderResult(parsed, options, targetInput, scopeEl, autoExecute);
-                } catch (err) {
-                    stopTurboSpinEffect();
-                    console.error(err);
-                    if (ui.contentBox) ui.contentBox.innerHTML = `<div style="color:#ef4444;">❌ 解析响应失败，请重试</div>`;
-                }
-            },
-            onerror: () => {
-                STATE.isAnalyzing = false;
-                stopTurboSpinEffect();
-                if (ui.contentBox) ui.contentBox.innerHTML = `<div style="color:#ef4444;">❌ 网络请求失败，请检查网络连接</div>`;
+                    if (matchedOpts.length === 0 && inputs[0] && ansText) {
+                        inputs[0].focus();
+                        setNativeInputValue(inputs[0], ansText);
+                    }
+                };
             }
         });
     }
 
-    function renderResult(parsed, options, targetInput, scopeEl, autoExecute = false) {
-        const ui = getUIElements();
-
-        querySelectorAllDeep('.ds-correct-highlight').forEach(el => el.classList.remove('ds-correct-highlight'));
-
-        const matchedOptions = [];
-        if (options.length > 0) {
-            const indices = Array.isArray(parsed.bestIndices)
-                ? parsed.bestIndices.map(Number).filter(n => !Number.isNaN(n))
-                : (parsed.bestIndex !== undefined ? [Number(parsed.bestIndex)] : []);
-
-            for (const idx of indices) {
-                if (options[idx]) {
-                    matchedOptions.push(options[idx]);
-                }
-            }
-
-            if (matchedOptions.length === 0 && parsed.answer) {
-                const ansClean = String(parsed.answer).replace(/^[A-H][.、\s)\]]*/i, '').trim();
-                const fallbackOpt = options.find(o =>
-                    o.text.includes(parsed.answer) ||
-                    parsed.answer.includes(o.text) ||
-                    (ansClean.length >= 2 && o.text.includes(ansClean))
-                );
-                if (fallbackOpt) matchedOptions.push(fallbackOpt);
-            }
-
-            matchedOptions.forEach(opt => {
-                opt.el.classList.add('ds-correct-highlight');
-            });
+    // 快捷键支持：Alt/Ctrl + W 直接触发全卷从头到尾自动全选
+    window.addEventListener('keydown', (e) => {
+        const isShortcutMod = e.altKey || (IS_MAC && e.ctrlKey && !e.metaKey);
+        if (isShortcutMod && e.code === 'KeyQ') {
+            e.preventDefault();
+            triggerSingleQuestionAnalysis();
+        } else if (isShortcutMod && e.code === 'KeyW') {
+            e.preventDefault();
+            if (STATE.isBatchRunning) STATE.stopBatchRequested = true;
+            else startFullPageAutoSweep();
         }
-
-        const answerText = parsed.answer || matchedOptions.map(o => o.text).join(' / ') || '已锁定';
-        const typeLabel = parsed.questionType === 'translate' ? '英文译文'
-            : (parsed.questionType === 'choice' || options.length > 0)
-                ? (autoExecute ? '⚡ <b style="color:#10b981;">正在滚屏并自动点选...</b>' : '正确选项（长按 🎯 自动滚屏点选）')
-            : parsed.questionType === 'essay' ? '简答答案' : '填空答案';
-
-        STATE.lastResultData = {
-            parsed,
-            scopeEl,
-            targetInput,
-            options,
-            matchedOptions,
-            answerText,
-            autoClicked: false,
-            altIdx: 0,
-            timestamp: Date.now()
-        };
-
-        if (ui.contentBox) {
-            ui.contentBox.innerHTML = `
-                <div class="ds-answer-box">
-                    <div style="font-size:11px;color:#94a3b8;margin-bottom:2px;">${typeLabel}</div>
-                    <div class="ds-answer-main" id="ds-main-answer-text">${escapeHtml(answerText)}</div>
-                    ${parsed.reason ? `<div class="ds-answer-sub">${escapeHtml(parsed.reason)}</div>` : ''}
-                </div>
-            `;
-        }
-
-        if (ui.footerBox) ui.footerBox.style.display = 'flex';
-
-        if (ui.fillBtn) {
-            const canAutoAct = matchedOptions.length > 0 || Boolean(targetInput);
-            ui.fillBtn.style.display = canAutoAct ? 'inline-flex' : 'none';
-            ui.fillBtn.innerText = matchedOptions.length > 0 ? '⚡ 滚屏并自动点选' : '✍️ 填入当前格';
-            ui.fillBtn.onclick = () => {
-                startTurboSpinEffect();
-                performScrollAndAutoClick(STATE.lastResultData);
-                ui.fillBtn.innerText = '✅ 已执行';
-                setTimeout(() => {
-                    ui.fillBtn.innerText = matchedOptions.length > 0 ? '⚡ 滚屏并自动点选' : '✍️ 填入当前格';
-                }, 1500);
-            };
-        }
-
-        const altList = [answerText, ...(parsed.altAnswers || [])].filter(Boolean);
-        if (ui.altBtn) {
-            ui.altBtn.style.display = altList.length > 1 ? 'inline-flex' : 'none';
-            ui.altBtn.onclick = () => {
-                STATE.lastResultData.altIdx = (STATE.lastResultData.altIdx + 1) % altList.length;
-                const currentAlt = altList[STATE.lastResultData.altIdx];
-                STATE.lastResultData.answerText = currentAlt;
-                const mainEl = (window.top.document || document).getElementById('ds-main-answer-text');
-                if (mainEl) mainEl.innerText = currentAlt;
-                if (targetInput && (targetInput.value || targetInput.innerText)) {
-                    setNativeInputValue(targetInput, currentAlt);
-                }
-            };
-        }
-
-        if (ui.modelBtn) {
-            ui.modelBtn.innerText = STATE.model === 'deepseek-reasoner' ? '🧠 当前R1' : '⚡ 当前V3';
-            ui.modelBtn.onclick = () => {
-                STATE.model = STATE.model === 'deepseek-chat' ? 'deepseek-reasoner' : 'deepseek-chat';
-                GM_setValue('DEEPSEEK_MODEL', STATE.model);
-                ui.modelBtn.innerText = STATE.model === 'deepseek-reasoner' ? '🧠 当前R1' : '⚡ 当前V3';
-            };
-        }
-
-        if (autoExecute) {
-            performScrollAndAutoClick(STATE.lastResultData);
-        }
-    }
+    });
 
     function setNativeInputValue(el, val) {
         if (!el) return;
