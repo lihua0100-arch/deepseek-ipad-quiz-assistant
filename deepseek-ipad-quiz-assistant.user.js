@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name    DeepSeek 智能题库助手 (iPad 学习通/U校园/全平台触屏通用版)
 // @namespace    https://tampermonkey.net/
-// @version      3.2.0
+// @version      3.3.0
 // @updateURL    https://raw.githubusercontent.com/lihua0100-arch/deepseek-ipad-quiz-assistant/main/deepseek-ipad-quiz-assistant.user.js
 // @downloadURL  https://raw.githubusercontent.com/lihua0100-arch/deepseek-ipad-quiz-assistant/main/deepseek-ipad-quiz-assistant.user.js
-// @description  专为 iPad Safari 与 Mac 打造（全面适配学习通 mooc1.chaoxing.com、U校园、超星尔雅）：默认启用 DeepSeek-R1 (deepseek-reasoner) 满血深度推理模型并搭配 6 路并发预取流水线，内置专业计算与高频概念防坑校验规则（彻底解决箱位号奇偶排换算、1CC/1AA箱长对比、超高标记、岸桥间隔等教材陷阱题），支持长按或三击从头到尾丝滑滚屏高准全选！
+// @description  专为 iPad Safari 与 Mac 打造（全面适配学习通 mooc1.chaoxing.com、U校园、超星尔雅）：1.默认启用 R1 深度推理 + 6路并发预取，修正“箱量少集中配装 vs 箱量大分散排位”边界；2.新增【批改结果页自动记忆】：提交后在详情页自动记住已做对的题、标准答案及做错的排除项，点击“重做”再刷时直接秒选已对题目并自动排除上次错项，轻松拿满分！
 // @author       Gemini
 // @match        *://*/*
 // @allFrames    true
@@ -26,24 +26,33 @@
     const IS_MAC = /Mac|iPod|iPhone|iPad/i.test(navigator.platform || navigator.userAgent);
 
     /********************************************************************
-     * 1. 配置参数与全局状态 (默认启用 R1 深度推理模型以保障最高准确率)
+     * 1. 配置参数与全局状态
      ********************************************************************/
     const CONFIG = {
         apiUrl: 'https://api.deepseek.com/chat/completions',
-        longPressDuration: 450,   // 长按触发全卷自动连刷的毫秒阈值
-        concurrency: 6            // 6 路并发预取流水线：让 R1 深度推理也能丝滑零等待连刷
+        longPressDuration: 450,
+        concurrency: 6
     };
 
     const STATE = {
         apiKey: GM_getValue('DEEPSEEK_API_KEY', ''),
-        // 默认优先使用 deepseek-reasoner (R1 深度思考模型)，彻底解决专业课陷阱题与计算题误判
         model: GM_getValue('DEEPSEEK_MODEL_V32', 'deepseek-reasoner'),
+        // 跨页持久化的“已验证正确题库 & 错题排除记录” { [stemKey]: { correctLetter, correctText, wrongLetters: [] } }
+        verifiedBank: GM_getValue('DEEPSEEK_VERIFIED_BANK', {}),
         isAnalyzing: false,
         isBatchRunning: false,
         stopBatchRequested: false,
         lastPickedScope: null,
         lastMousePos: { x: window.innerWidth / 2, y: window.innerHeight / 2 }
     };
+
+    function normalizeStemKey(text) {
+        return String(text || '')
+            .replace(/^\s*\d+[.、\s)）]*/, '')
+            .replace(/\([单多判填简]选题.*?\)/g, '')
+            .replace(/[\s_—\-，。；：？！、,.?;:!()（）【】\[\]"'“”‘’]/g, '')
+            .slice(0, 80);
+    }
 
     /********************************************************************
      * 2. 页面主环境点击桥接器 (Main-World Click Bridge)
@@ -104,7 +113,7 @@
     injectMainWorldBridge();
 
     /********************************************************************
-     * 3. UI 样式：GPU 硬件加速涡轮旋转与高对比进度卡片
+     * 3. UI 样式
      ********************************************************************/
     const isTopFrame = window.self === window.top;
 
@@ -171,7 +180,7 @@
             position: fixed;
             right: 16px;
             bottom: 92px;
-            width: 348px;
+            width: 350px;
             max-width: calc(100vw - 32px);
             background: rgba(15, 23, 42, 0.95);
             color: #f8fafc;
@@ -332,20 +341,20 @@
         fabEl = document.createElement('div');
         fabEl.id = 'ds-fab';
         fabEl.innerHTML = '🎯';
-        fabEl.title = '单击：解析单题 | 长按 或 连点3下：R1满血深度推理 + 6路并发全卷高准全选！';
+        fabEl.title = '单击：解析单题/吸取批改页答案 | 长按 或 连点3下：全卷丝滑滚屏高准全选！';
         document.body.appendChild(fabEl);
 
         cardEl = document.createElement('div');
         cardEl.id = 'ds-card';
         cardEl.innerHTML = `
             <div class="ds-card-header">
-                <span class="ds-card-title">💡 DeepSeek 题库助手 3.2 (R1满血版)</span>
+                <span class="ds-card-title">💡 DeepSeek 题库助手 3.3 (满分记忆版)</span>
                 <span class="ds-card-close" id="ds-card-close-btn">✕</span>
             </div>
             <div id="ds-card-content">
                 <div style="color:#94a3b8;font-size:12px;">
-                    • <b>轻点 1 下 🎯</b>：R1 深度解析当前单题<br>
-                    • <b>长按 🎯 或 连点 3 下 🎯</b>：启动<b>R1 深度思考 + 6 路并发预取</b>，从头到尾丝滑滚屏并高准确率选上所有答案！
+                    • <b>轻点 1 下 🎯</b>：解析当前单题（若在批改详情页则自动记忆整页标准答案与错题）<br>
+                    • <b>长按 🎯 或 连点 3 下 🎯</b>：启动<b>R1 深度推理 + 错题记忆排除</b>，从头到尾滚屏全选！
                 </div>
             </div>
             <div class="ds-card-actions" id="ds-card-footer" style="margin-top:6px;display:flex;">
@@ -380,7 +389,7 @@
         });
 
         /****************************************************************
-         * 4. 悬浮球手势引擎：单击 / 长按 / 三连击 / 拖拽
+         * 4. 悬浮球手势引擎
          ****************************************************************/
         let isPressing = false;
         let startX = 0, startY = 0;
@@ -517,7 +526,79 @@
     }, { passive: true });
 
     /********************************************************************
-     * 5. 丝滑单容器滚屏引擎
+     * 5. 批改结果页自动记忆引擎 (Graded Page Auto-Harvester)
+     * 说明：当打开学习通/超星“作业详情”批改页（含有“我的答案 / 正确答案”或对错号）时，
+     * 自动吸取所有已判明对错的答案存入本地记忆库。点击“重做”时，做对的题直接 0 延时秒选，
+     * 做错的题自动附带错误排除项交给 R1 重算，确保第二次重做稳拿 100 分！
+     ********************************************************************/
+    function harvestGradedPageAnswers() {
+        const blocks = querySelectorAllDeep('.TiMu, .questionLi, .singleQuesId, .question-item, [class*="question"]');
+        let learnedRight = 0;
+        let learnedWrong = 0;
+        const bank = Object.assign({}, GM_getValue('DEEPSEEK_VERIFIED_BANK', {}));
+
+        for (const block of blocks) {
+            const fullTxt = (block.innerText || '').replace(/\s+/g, ' ').trim();
+            if (!fullTxt.includes('我的答案')) continue;
+
+            const opts = extractOptionsFromBlock(block);
+            const stem = extractPureQuestionStem(block, opts, null);
+            const key = normalizeStemKey(stem);
+            if (!key || key.length < 4) continue;
+
+            const myAnsMatch = fullTxt.match(/我的答案\s*[:：]\s*([A-H]+)/i);
+            const rightAnsMatch = fullTxt.match(/正确答案\s*[:：]\s*([A-H]+)/i);
+            const isMarkedCorrect = Boolean(
+                block.querySelector('.marking_duigou, .icon-right, [class*="right"], [class*="correct"]') ||
+                (myAnsMatch && rightAnsMatch && myAnsMatch[1].toUpperCase() === rightAnsMatch[1].toUpperCase()) ||
+                /[1-9]\d*\s*分/.test(fullTxt) && !/\b0\s*分/.test(fullTxt)
+            );
+            const isMarkedWrong = Boolean(
+                block.querySelector('.marking_cuowu, .icon-wrong, [class*="wrong"], [class*="error"]') ||
+                /\b0\s*分/.test(fullTxt)
+            );
+
+            const entry = bank[key] || { correctLetters: [], wrongLetters: [] };
+
+            if (rightAnsMatch) {
+                entry.correctLetters = rightAnsMatch[1].toUpperCase().split('');
+                learnedRight++;
+            } else if (isMarkedCorrect && myAnsMatch) {
+                entry.correctLetters = myAnsMatch[1].toUpperCase().split('');
+                learnedRight++;
+            } else if (isMarkedWrong && myAnsMatch) {
+                const wrongLet = myAnsMatch[1].toUpperCase();
+                if (!entry.wrongLetters.includes(wrongLet)) {
+                    entry.wrongLetters.push(wrongLet);
+                }
+                learnedWrong++;
+            }
+
+            bank[key] = entry;
+        }
+
+        if (learnedRight > 0 || learnedWrong > 0) {
+            STATE.verifiedBank = bank;
+            GM_setValue('DEEPSEEK_VERIFIED_BANK', bank);
+            const ui = getUIElements();
+            if (ui.card && ui.contentBox) {
+                ui.card.style.display = 'block';
+                ui.contentBox.innerHTML = `
+                    <div class="ds-answer-box">
+                        <div class="ds-answer-main">📚 已自动记忆本页批改结果！</div>
+                        <div class="ds-answer-sub">已锁定 <b>${learnedRight}</b> 道标准答案、记录 <b>${learnedWrong}</b> 道错题排除项。点击页面<b>“重做”</b>后再长按 🎯 即可直接秒拿满分！</div>
+                    </div>
+                `;
+            }
+        }
+        return { learnedRight, learnedWrong };
+    }
+
+    // 页面加载 1.2 秒后自动检测是否处于批改详情页，若是则静默吸取全部答案
+    setTimeout(harvestGradedPageAnswers, 1200);
+
+    /********************************************************************
+     * 6. 丝滑单容器滚屏引擎
      ********************************************************************/
     function startTurboSpinEffect() {
         const { fab, sweepBtn } = getUIElements();
@@ -571,7 +652,7 @@
         }
     }
 
-    function smoothScrollToElementAsync(el, duration = 260) {
+    function smoothScrollToElementAsync(el, duration = 240) {
         return new Promise((resolve) => {
             if (!el) {
                 resolve();
@@ -661,7 +742,7 @@
     }
 
     /********************************************************************
-     * 6. 精准题目与选项提取器
+     * 7. 精准题目与选项提取器
      ********************************************************************/
     const STRICT_QUESTION_BLOCK_SELECTORS = [
         '.TiMu', '.singleQuesId', '.questionLi',
@@ -800,9 +881,12 @@
 
         clone.querySelectorAll('[data-ds-opt-remove="1"]').forEach(el => el.remove());
         clone.querySelectorAll('[data-ds-marker]').forEach(el => el.replaceWith(el.getAttribute('data-ds-marker')));
-        clone.querySelectorAll('style, script, .ans-icon, .font-cxsecret-ignore').forEach(el => el.remove());
+        clone.querySelectorAll('style, script, .ans-icon, .font-cxsecret-ignore, .marking_duigou, .marking_cuowu').forEach(el => el.remove());
 
-        const pureStem = (clone.innerText || clone.textContent || '').replace(/\s+/g, ' ').trim();
+        const pureStem = (clone.innerText || clone.textContent || '')
+            .replace(/我的答案\s*[:：].*$/g, '')
+            .replace(/\s+/g, ' ')
+            .trim();
         return pureStem.length >= 4 ? pureStem : (blockEl.innerText || '').replace(/\s+/g, ' ').trim();
     }
 
@@ -856,10 +940,24 @@
     }
 
     /********************************************************************
-     * 7. R1 深度推理 + 专业教材防坑知识库引擎
+     * 8. R1 深度推理 + 历史验证记忆库优先命中引擎
      ********************************************************************/
     function requestSingleQuestionCoTAnalysis(q, overrideModel = null) {
         return new Promise((resolve) => {
+            STATE.verifiedBank = GM_getValue('DEEPSEEK_VERIFIED_BANK', STATE.verifiedBank || {});
+            const stemKey = normalizeStemKey(q.stemText);
+            const memoryEntry = STATE.verifiedBank[stemKey];
+
+            // 1. 若本地验证题库中已有 100% 确认过的标准答案（来自上次批改对勾或标准答案），直接 0 延时秒回！
+            if (memoryEntry && Array.isArray(memoryEntry.correctLetters) && memoryEntry.correctLetters.length > 0) {
+                resolve({
+                    thinking: '📚 命中已验证满分题库记忆，直接锁定标准答案',
+                    answerLetters: memoryEntry.correctLetters,
+                    answerTexts: []
+                });
+                return;
+            }
+
             const useModel = overrideModel || STATE.model;
             const isMultiChoice = /多选|多项|more than one|multiple/i.test(q.stemText);
             const isTrueFalse = q.options.length === 2 && q.options.some(o => /对|错|正确|错误|true|false|√|×/i.test(o.text));
@@ -869,7 +967,11 @@
                 ? q.options.map(o => `选项 ${o.letter}: ${o.cleanContent}`).join('\n')
                 : '（本题为填空或主观题，无候选选项）';
 
-            // 内置专业课高频易错考点与防坑准则（专门解决《船舶货运/集装箱运输》等教材标准定义陷阱）
+            // 若上次重做前记录了该题曾选错的选项，明确告知模型予以排除！
+            const wrongExclusionNote = (memoryEntry && Array.isArray(memoryEntry.wrongLetters) && memoryEntry.wrongLetters.length > 0)
+                ? `\n⚠️【重要错题排除指令】：本题在上次提交时选择【${memoryEntry.wrongLetters.join(', ')}】被判为 0 分错误！本次严禁再选 ${memoryEntry.wrongLetters.join(', ')}，请务必从其余选项中推导正确答案！`
+                : '';
+
             const systemPrompt = [
                 '你是一个满分级别的高校专业课与四六级权威题库解析专家。',
                 '请严格遵循中国高校教材标准定义与以下高频防坑铁律进行推理：',
@@ -881,14 +983,14 @@
                 '   - 集装箱端门标志：第1行是箱主代号+设备识别码(U/J/Z)+顺序号+核对数字；第2行是国籍代号+尺寸和类型代码；【第3行是集装箱最大总重(MAX GROSS)和自重(TARE)】！',
                 '   - 两个 1CC 型(20ft，实长 6058mm = 19ft 10.5in)长度之和(12116mm)比一个 1AA 型(40ft，实长 12192mm)要【短】（留有 3 英寸/76mm 间隙）！',
                 '   - 集装箱超高标记中的数字表示【集装箱的实际高度】（如 2.9m / 9\'6"），而非超出尺寸！',
-                '3.【集装箱配积载与系固防坑】：',
-                '   - 配积载文件中，【初配图是总图加行箱位图】；',
-                '   - 多装货港且第一装货港箱量大时，为加速装卸缩短停泊时间，应安排在【①不同的排位(Bay)上且间隔一定距离】（同排的不同列/不同层无法同时让多台岸桥作业）；两台装卸桥同时作业不允许紧靠，必须【至少纵向间隔一个 40 英尺行箱位】；',
-                '   - 集装箱船专用的绑扎系固设备包括：【①桥锁、②扭锁、④连接板、⑤锥板、⑥高度补偿器】（不含③普通钢丝绳）。',
+                '3.【集装箱配积载与系固防坑（注意区分箱量多与箱量少！）】：',
+                '   - 同一卸港/装货港的集装箱【数量少（箱量少）】时，为便利装卸、避免装卸桥频繁移位，应【集中配装】！',
+                '   - 只有当有两个以上装货港且第一装货港【需要装载较多（箱量大）】时，为让多台岸桥同时作业缩短停泊时间，才安排在【①不同的排位(Bay)上且间隔一定距离】；两台装卸桥同时作业必须【至少纵向间隔一个 40 英尺行箱位】；',
+                '   - 配积载文件中，【初配图是总图加行箱位图】；集装箱船专用的绑扎系固设备包括：【①桥锁、②扭锁、④连接板、⑤锥板、⑥高度补偿器】（不含③普通钢丝绳）。',
                 '必须严格返回如下 JSON 格式（不要包含任何 Markdown 代码块标签）：',
                 '{',
                 '  "thinking": "简明推导计算步骤与教材依据",',
-                '  "answerLetters": ["正确选项大写字母，如 \\"D\\""],',
+                '  "answerLetters": ["正确选项大写字母，如 \\"B\\""],',
                 '  "answerTexts": ["正确选项完整原文内容"]',
                 '}'
             ].join('\n');
@@ -896,8 +998,9 @@
             const userPrompt = [
                 `题目类型：${qTypeHint}`,
                 `题干内容：${q.stemText}`,
-                `候选选项：\n${formattedOptions}`
-            ].join('\n\n');
+                `候选选项：\n${formattedOptions}`,
+                wrongExclusionNote
+            ].filter(Boolean).join('\n\n');
 
             const payload = {
                 model: useModel,
@@ -922,7 +1025,6 @@
                 onload: (res) => {
                     try {
                         if (res.status !== 200) {
-                            // 若 R1 接口不可用，自动降级用 V3 重试一次
                             if (useModel === 'deepseek-reasoner') {
                                 requestSingleQuestionCoTAnalysis(q, 'deepseek-chat').then(resolve);
                                 return;
@@ -1009,9 +1111,12 @@
     }
 
     /********************************************************************
-     * 8. 6 路并发预取流水线 + 全卷自动滚屏全选
+     * 9. 6 路并发预取流水线 + 全卷自动滚屏全选
      ********************************************************************/
     async function startFullPageAutoSweep() {
+        // 如果当前在批改详情页，先吸取一遍答案
+        harvestGradedPageAnswers();
+
         const ui = getUIElements();
         if (!STATE.apiKey) {
             const key = prompt('请输入您的 DeepSeek API Key (sk-...):', '');
@@ -1053,7 +1158,6 @@
             }
         }
 
-        // 立即启动前 6 道题的并发 R1 深度推理
         triggerPrefetchUpTo(CONFIG.concurrency);
 
         const updateSweepProgressUI = (curNum, titlePreview, answerPreview, thinkingNote) => {
@@ -1085,11 +1189,11 @@
             const curNum = i + 1;
 
             q.blockEl.classList.add('ds-scope-flash');
-            updateSweepProgressUI(curNum, q.stemText, '🧠 R1 正在深度推导答案...', '');
+            updateSweepProgressUI(curNum, q.stemText, '🧠 正在定位并推导答案...', '');
 
             const [parsed] = await Promise.all([
                 resultPromises[i],
-                smoothScrollToElementAsync(q.blockEl, 250)
+                smoothScrollToElementAsync(q.blockEl, 230)
             ]);
 
             if (STATE.stopBatchRequested) {
@@ -1120,8 +1224,8 @@
                 updateSweepProgressUI(curNum, q.stemText, firstAnsText || '⚠️ 未匹配到选项', parsed?.thinking || '');
             }
 
-            setTimeout(() => q.blockEl.classList.remove('ds-scope-flash'), 450);
-            await sleep(200);
+            setTimeout(() => q.blockEl.classList.remove('ds-scope-flash'), 400);
+            await sleep(180);
         }
 
         STATE.isBatchRunning = false;
@@ -1139,7 +1243,7 @@
                 ui.contentBox.innerHTML = `
                     <div class="ds-answer-box">
                         <div class="ds-answer-main">🎉 全卷 ${completedCount} / ${total} 题已全部选完！</div>
-                        <div class="ds-answer-sub">已使用 ${STATE.model === 'deepseek-reasoner' ? 'R1 满血深度推理' : 'V3'} 完成全部题目，请检查后提交。</div>
+                        <div class="ds-answer-sub">已完成全部题目点选，请检查后提交。</div>
                     </div>
                 `;
             }
@@ -1147,7 +1251,7 @@
     }
 
     /********************************************************************
-     * 9. 原有单题解析功能（轻点 1 下悬浮球触发）
+     * 10. 原有单题解析功能（轻点 1 下悬浮球触发）
      ********************************************************************/
     function findSingleQuestionScope() {
         const ui = getUIElements();
@@ -1187,6 +1291,12 @@
     }
 
     function triggerSingleQuestionAnalysis() {
+        // 如果当前在批改结果详情页，轻点一下先自动吸取整页标准答案与错题记录
+        const harvested = harvestGradedPageAnswers();
+        if (harvested.learnedRight > 0 || harvested.learnedWrong > 0) {
+            return;
+        }
+
         const ui = getUIElements();
         if (!STATE.apiKey) {
             const key = prompt('请输入您的 DeepSeek API Key (sk-...):', '');
