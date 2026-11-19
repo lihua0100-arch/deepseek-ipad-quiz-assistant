@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name    DeepSeek 智能题库助手 (iPad 学习通/U校园/全平台触屏通用版)
 // @namespace    https://tampermonkey.net/
-// @version      3.6.0
+// @version      3.7.0
 // @updateURL    https://raw.githubusercontent.com/lihua0100-arch/deepseek-ipad-quiz-assistant/main/deepseek-ipad-quiz-assistant.user.js
 // @downloadURL  https://raw.githubusercontent.com/lihua0100-arch/deepseek-ipad-quiz-assistant/main/deepseek-ipad-quiz-assistant.user.js
-// @description  准确率优先旗舰版（适配手机 / iPad Safari / Mac / PC，支持学习通、U校园、超星尔雅、雨课堂、智慧树）：1.默认全题 DeepSeek-R1 深度推理+反向验算，针对高数、否定题、组合编号题、物理/专业公式题深度优化；2.无损提取 KaTeX/MathJax/MathML/上下标/公式图片 LaTeX，自动剔除“AI讲解”等干扰词；3.联网搜题独立限速队列+单题/连刷统一题干与会话缓存，彻底消除单次与连续答题不一致；4.内置一键查看/复制诊断日志面板！
+// @description  全题型准确率优先旗舰版（适配手机 / iPad Safari Stay / Tampermonkey，支持学习通、U校园、超星尔雅、雨课堂、智慧树）：1.全面支持选择题（单/多/判断）、填空题（多空顺序自动填入+富文本自动保存）、大题（简答/计算/证明/论述完整分步解答+一键复制/填入，含无输入框拍照题）；2.默认全题 DeepSeek-R1 深度推理+高数反向验算；3.无损提取 KaTeX/MathJax/MathML/上下标/公式图片，限速联网搜题+会话缓存彻底消除单题与连刷不一致！
 // @author       Gemini
 // @match        *://*/*
 // @allFrames    true
@@ -905,6 +905,14 @@
             color: #34d399;
             margin-bottom: 4px;
             user-select: all;
+            white-space: pre-wrap;
+        }
+        .ds-answer-main.ds-answer-essay {
+            font-size: 13.5px;
+            font-weight: 500;
+            line-height: 1.65;
+            color: #e2e8f0;
+            user-select: text;
         }
         .ds-answer-sub {
             font-size: 12px;
@@ -1152,7 +1160,7 @@
         cardEl.id = 'ds-card';
         cardEl.innerHTML = `
             <div class="ds-card-header">
-                <span class="ds-card-title">🔬 DeepSeek 题库助手 3.6 (准确率优先)</span>
+                <span class="ds-card-title">🔬 DeepSeek 题库助手 3.7 (全题型高准)</span>
                 <span class="ds-header-icons">
                     <button class="ds-icon-btn" id="ds-card-log-btn" title="查看/复制诊断日志">📋</button>
                     <button class="ds-icon-btn" id="ds-card-settings-btn" title="设置 API Key 与题库">⚙️</button>
@@ -1185,8 +1193,8 @@
             </div>
             <div id="ds-card-content">
                 <div style="color:#cbd5e1;font-size:12px;line-height:1.6;">
-                    • <b>默认全题 DeepSeek-R1 深度推理 + 限速防封联网搜题</b>，优先保证最高正确率！<br>
-                    • <b>轻点 1 下 🎯</b>：解析当前题目（与连刷共用同一套题干和结果缓存，杜绝前后不一致）<br>
+                    • <b>全题型高准支持</b>：选择题自动点选、填空题多空顺序填入、<b>大题（计算/证明/简答/论述）输出完整步骤</b>支持一键填入或复制！<br>
+                    • <b>轻点 1 下 🎯</b>：R1 深度解析当前题（无输入框的拍照大题也能解）<br>
                     • <b>长按 🎯 或 连点 3 下 🎯</b>：全卷 R1 深度高准自动连刷（右上角 📋 可看每题日志）
                 </div>
             </div>
@@ -1773,6 +1781,51 @@
         });
     }
 
+    function isEssayStemHint(text) {
+        return /(简答题|计算题|证明题|论述题|解答题|分析题|应用题|综合题|案例分析|名词解释|问答题|作图题|试证|求证|证明\s*[：:]|请简述|试述|试分析|请论述|写出.*过程|详细步骤|计算下列|求解下列)/i.test(String(text || ''));
+    }
+
+    function classifyQuestionType(q) {
+        const stem = String(q?.stemText || '');
+        const opts = Array.isArray(q?.options) ? q.options : [];
+        const inps = Array.isArray(q?.inputs) ? q.inputs : [];
+
+        if (opts.length >= 2) {
+            if (/多选|多项|more than one|multiple/i.test(stem)) {
+                return { kind: 'multi', label: '多选题', blankCount: 0 };
+            }
+            if (opts.length === 2 && opts.some(o => /对|错|正确|错误|true|false|√|×/i.test(o.text || ''))) {
+                return { kind: 'truefalse', label: '判断题', blankCount: 0 };
+            }
+            return { kind: 'single', label: '单选题', blankCount: 0 };
+        }
+
+        // 无选项：区分【填空题】vs【大题（计算/证明/简答/论述/拍照上传题）】
+        const isExplicitBlank = /填空题|fill\s*in/i.test(stem);
+        const hasBlankMarkers = /_{2,}|\[\[空格\d+/.test(stem);
+        const isExplicitEssay = isEssayStemHint(stem);
+
+        let hasLargeEditor = false;
+        for (const inp of inps) {
+            try {
+                const tag = (inp.tagName || '').toUpperCase();
+                const r = inp.getBoundingClientRect ? inp.getBoundingClientRect() : { height: 0 };
+                if (tag === 'TEXTAREA' || inp.isContentEditable || /edui/i.test(inp.className || '') || r.height >= 72) {
+                    hasLargeEditor = true;
+                    break;
+                }
+            } catch (_) {}
+        }
+
+        // 明确标注为大题，或没有输入框（纯拍照上传大题），或只有一个大尺寸富文本框且非明确填空题 -> 判为大题
+        if (!isExplicitBlank && (isExplicitEssay || inps.length === 0 || (inps.length === 1 && hasLargeEditor && !hasBlankMarkers))) {
+            return { kind: 'essay', label: '大题', blankCount: 0 };
+        }
+
+        const blankCount = inps.length > 0 ? inps.length : Math.max(1, (stem.match(/_{2,}/g) || []).length);
+        return { kind: 'blank', label: '填空题', blankCount };
+    }
+
     function extractPureQuestionStem(blockEl, optionsList = [], targetInput = null) {
         if (!blockEl) return '';
 
@@ -1804,6 +1857,7 @@
 
         clone.querySelectorAll('[data-ds-opt-remove="1"]').forEach(el => el.remove());
         clone.querySelectorAll('[data-ds-marker]').forEach(el => el.replaceWith(el.getAttribute('data-ds-marker')));
+        clone.querySelectorAll('.edui-editor, .edui-default, iframe[id*="ueditor"]').forEach(el => el.remove());
 
         const pureStem = extractRichMathText(clone)
             .replace(/我的答案\s*[:：].*$/g, '')
@@ -1819,7 +1873,10 @@
             if (r.width < 100 || r.height < 24) return false;
             const opts = extractOptionsFromBlock(el);
             const inps = extractInputsFromBlock(el);
-            return opts.length >= 2 || inps.length >= 1;
+            if (opts.length >= 2 || inps.length >= 1) return true;
+            // 也收纳无输入框的拍照/手写上传大题（如高数证明/计算题）
+            const rawTxt = extractRichMathText(el);
+            return rawTxt.length >= 10 && (isEssayStemHint(rawTxt) || /上传图片|上传附件|拍照上传/.test(rawTxt));
         });
 
         validBlocks = validBlocks.filter(el => !validBlocks.some(other => other !== el && el.contains(other)));
@@ -1960,7 +2017,8 @@
         return { ok: false, status: 0, text: '' };
     }
 
-    function buildSystemPrompt(isMath, isMaritime, blankCount) {
+    function buildSystemPrompt(isMath, isMaritime, qTypeInfo) {
+        const { kind = 'single', blankCount = 0 } = qTypeInfo || {};
         const baseLines = [
             '你是一位满分级高校学科、大学数学（高等数学/线代/概率）与海运/工程专业课解题专家。',
             '核心目标：追求 100% 准确率，严禁凭第一直觉草率作答。'
@@ -2004,10 +2062,19 @@
             );
         }
 
-        if (blankCount > 0) {
+        if (kind === 'blank') {
             baseLines.push(
                 '',
-                `【填空题输出规范】：本题共有 ${blankCount} 个空格，请在 answerTexts 数组中按空格顺序精确输出 ${blankCount} 个最简标准答案（例如 "1/2"、"e^2"、"0"），不要多余解释文字。`
+                `【✍️ 填空题输出规范】：本题共有 ${Math.max(1, blankCount)} 个空格，请在 answerTexts 数组中按空格顺序精确输出 ${Math.max(1, blankCount)} 个最简标准答案（例如 "1/2"、"e^2"、"0"、"x^2+C"），绝对不要附带“答案是”或多余解释文字。`
+            );
+        } else if (kind === 'essay') {
+            baseLines.push(
+                '',
+                '【📝 大题（计算题 / 证明题 / 简答题 / 论述题）规范作答协议】：',
+                '- 请在 answerTexts[0] 中输出可直接提交或手写抄录的【完整规范解答】（使用 \\n 换行分段）：',
+                '  * 数学计算/证明大题：以“解：”或“证明：”开头，分步写出核心公式、换元/求导/积分过程、边界条件代入与最终结论（优先使用清晰易读的数学符号，如 ∫、√、≤、≥、π、x^2、1/2）；',
+                '  * 文科/专业课简答/论述/分析题：按“1. ...\\n2. ...\\n3. ...”分点条理作答，紧扣教材标准踩分点，结论明确。',
+                '- thinking 字段只写简短的验算核对结论（如“已求导反验，边界条件吻合”），完整答题内容全部放在 answerTexts[0] 中！'
             );
         }
 
@@ -2016,8 +2083,8 @@
             '必须严格返回合法 JSON（不要包含 Markdown 代码块；JSON 字符串内的反斜杠请双写为 \\\\ 或用简洁 ASCII/Unicode 数学符号）：',
             '{',
             '  "thinking": "精炼的关键推导步骤、公式或教材依据与反向验算结论（不超过150字）",',
-            '  "answerLetters": ["正确选项大写字母，如 \\"D\\"；填空题可为空数组 []"],',
-            '  "answerTexts": ["正确选项完整原文内容；填空题按空格顺序填写每个空的答案"],',
+            '  "answerLetters": ["正确选项大写字母，如 \\"D\\"；填空题和大题留空数组 []"],',
+            '  "answerTexts": ["选择题填正确选项原文；填空题按空格顺序填最简答案；大题在 answerTexts[0] 填完整规范解答过程"],',
             '  "confidence": 0.95',
             '}'
         );
@@ -2090,23 +2157,25 @@
         const searchRes = await searchWebForQuestionClues(q.stemText, q.options, isMath);
         const webClues = searchRes.clues || '';
 
-        const isMultiChoice = /多选|多项|more than one|multiple/i.test(q.stemText);
-        const isTrueFalse = q.options.length === 2 && q.options.some(o => /对|错|正确|错误|true|false|√|×/i.test(o.text));
-        const blankCount = q.options.length === 0 ? (q.inputs?.length || 1) : 0;
-        const qTypeHint = isMultiChoice
-            ? '【多选题（可能有 2~4 个正确项，请逐项核验）】'
-            : (isTrueFalse ? '【判断题（请严格判断对/错并尝试找反例）】'
-                : (q.options.length > 0 ? '【单选题（必选唯一最严谨正确项）】' : `【填空/主观题（共 ${blankCount} 空）】`));
+        const qTypeInfo = classifyQuestionType(q);
+        const qTypeHintMap = {
+            multi: '【多选题（可能有 2~4 个正确项，请逐项核验）】',
+            truefalse: '【判断题（请严格判断对/错并尝试找反例）】',
+            single: '【单选题（必选唯一最严谨正确项）】',
+            blank: `【填空题（共 ${qTypeInfo.blankCount} 空，只需最简标准答案）】`,
+            essay: '【大题（计算题/证明题/简答题/论述题，必须给出完整规范的解答步骤或分点答案）】'
+        };
+        const qTypeHint = qTypeHintMap[qTypeInfo.kind] || '【单选题】';
 
         const formattedOptions = q.options.length > 0
             ? q.options.map(o => `选项 ${o.letter}: ${o.cleanContent}`).join('\n')
-            : '（本题为填空或主观题，无候选选项）';
+            : (qTypeInfo.kind === 'essay' ? '（本题为大题/主观解答题，无候选选项，请输出完整规范解答步骤）' : '（本题为填空题，无候选选项）');
 
         const wrongExclusionNote = (memoryEntry && Array.isArray(memoryEntry.wrongLetters) && memoryEntry.wrongLetters.length > 0)
             ? `⚠️【重要错题排除指令】：本题上次提交选择【${memoryEntry.wrongLetters.join(', ')}】被判 0 分错误！严禁再选 ${memoryEntry.wrongLetters.join(', ')}，请从其余选项重新推导！`
             : '';
 
-        const systemPrompt = buildSystemPrompt(isMath, isMaritime, blankCount);
+        const systemPrompt = buildSystemPrompt(isMath, isMaritime, qTypeInfo);
 
         const userPrompt = [
             `题目类型：${qTypeHint}${isMath ? '（高等数学/数学计算题）' : ''}`,
@@ -2167,6 +2236,7 @@
         parsed.webCount = searchRes.count;
         parsed.usedModel = useModel;
         parsed.isMath = isMath;
+        parsed.questionKind = qTypeInfo.kind;
 
         // 智能分流模式下若 V3 置信度低于阈值或未能匹配选项，自动升级 R1 复核
         const conf = typeof parsed.confidence === 'number' ? parsed.confidence : 0.9;
@@ -2183,6 +2253,7 @@
                         r1Parsed.webCount = searchRes.count;
                         r1Parsed.usedModel = 'deepseek-reasoner';
                         r1Parsed.isMath = isMath;
+                        r1Parsed.questionKind = qTypeInfo.kind;
                         r1Parsed.escalated = true;
                         parsed = r1Parsed;
                     }
@@ -2288,18 +2359,22 @@
     }
 
     function applyAnswerToQuestion(q, parsed) {
+        const qTypeInfo = classifyQuestionType(q);
         const matchedOpts = matchOptionsAccurately(q.options, parsed);
         const ansTexts = Array.isArray(parsed?.answerTexts)
             ? parsed.answerTexts.map(t => String(t).trim()).filter(Boolean)
             : (parsed?.answer ? [String(parsed.answer).trim()] : []);
 
         if (matchedOpts.length > 0) {
-            return { type: 'choice', matchedOpts, ansTexts };
+            return { type: 'choice', kind: qTypeInfo.kind, matchedOpts, ansTexts };
         }
         if (q.inputs && q.inputs.length > 0 && ansTexts.length > 0) {
-            return { type: 'input', matchedOpts: [], ansTexts };
+            return { type: 'input', kind: qTypeInfo.kind, matchedOpts: [], ansTexts };
         }
-        return { type: 'none', matchedOpts: [], ansTexts };
+        if (ansTexts.length > 0) {
+            return { type: 'display-only', kind: qTypeInfo.kind, matchedOpts: [], ansTexts };
+        }
+        return { type: 'none', kind: qTypeInfo.kind, matchedOpts: [], ansTexts };
     }
 
     function buildFullPaperCrossContext(allQuestions) {
@@ -2423,16 +2498,30 @@
                 }
                 completedCount++;
             } else if (action.type === 'input') {
-                for (let k = 0; k < q.inputs.length; k++) {
-                    const val = action.ansTexts[k] ?? action.ansTexts[0];
-                    if (val !== undefined) {
-                        const inp = q.inputs[k];
-                        inp.focus();
-                        setNativeInputValue(inp, String(val).trim());
-                        inp.classList.add('ds-correct-highlight');
+                const isEssay = action.kind === 'essay';
+                if (isEssay) {
+                    const fullEssay = action.ansTexts.join('\n');
+                    const inp = q.inputs[0];
+                    inp.focus();
+                    setNativeInputValue(inp, fullEssay, true);
+                    inp.classList.add('ds-correct-highlight');
+                    updateSweepProgressUI(curNum, q.stemText, `📝 大题已填：${fullEssay.slice(0, 60)}${fullEssay.length > 60 ? '...' : ''}`, parsed?.thinking || '', parsed || {});
+                } else {
+                    for (let k = 0; k < q.inputs.length; k++) {
+                        const val = action.ansTexts[k] ?? action.ansTexts[0];
+                        if (val !== undefined) {
+                            const inp = q.inputs[k];
+                            inp.focus();
+                            setNativeInputValue(inp, String(val).trim(), false);
+                            inp.classList.add('ds-correct-highlight');
+                        }
                     }
+                    updateSweepProgressUI(curNum, q.stemText, `✍️ 填空已填：${action.ansTexts.join(' | ')}`, parsed?.thinking || '', parsed || {});
                 }
-                updateSweepProgressUI(curNum, q.stemText, `✍️ 已填：${action.ansTexts.join(' | ')}`, parsed?.thinking || '', parsed || {});
+                completedCount++;
+            } else if (action.type === 'display-only') {
+                const preview = action.ansTexts.join('\n');
+                updateSweepProgressUI(curNum, q.stemText, `📝 无输入框大题（可在日志/单题复制）：${preview.slice(0, 70)}...`, parsed?.thinking || '', parsed || {});
                 completedCount++;
             } else {
                 updateSweepProgressUI(curNum, q.stemText, action.ansTexts[0] || '⚠️ 未匹配到选项', parsed?.thinking || '', parsed || {});
@@ -2532,12 +2621,15 @@
 
         const action = applyAnswerToQuestion(qObj, parsed);
         action.matchedOpts.forEach(opt => opt.el.classList.add('ds-correct-highlight'));
+        const isEssay = action.kind === 'essay';
 
         const ansDisplay = action.type === 'choice'
             ? action.matchedOpts.map(o => `${o.letter}. ${o.cleanContent}`).join(' | ')
-            : (action.ansTexts.join(' | ') || '已解析');
+            : (isEssay ? action.ansTexts.join('\n') : (action.ansTexts.join(' | ') || '已解析'));
 
         const badges = [];
+        if (isEssay) badges.push('<span class="ds-badge ds-badge-math">📝 大题完整解答</span>');
+        else if (action.kind === 'blank') badges.push('<span class="ds-badge">✍️ 填空题</span>');
         if (parsed.isMath) badges.push('<span class="ds-badge ds-badge-math">📐 高数专项</span>');
         if (parsed.usedModel === 'deepseek-reasoner') {
             badges.push(`<span class="ds-badge">🔬 R1深度${parsed.escalated ? '复核' : '验算'}</span>`);
@@ -2550,15 +2642,19 @@
             badges.push(`<span class="ds-badge">🌐 搜到${parsed.webCount}条</span>`);
         }
 
+        const canApply = action.type === 'choice' || action.type === 'input';
+        const copyableText = action.ansTexts.length > 0 ? action.ansTexts.join('\n') : ansDisplay;
+
         ui.contentBox.innerHTML = `
             <div class="ds-answer-box">
                 <div class="ds-answer-meta">${badges.join('')}</div>
-                <div class="ds-answer-main">${escapeHtml(ansDisplay)}</div>
+                <div class="ds-answer-main${isEssay ? ' ds-answer-essay' : ''}">${escapeHtml(ansDisplay)}</div>
                 ${parsed.thinking ? `<div class="ds-answer-sub">${escapeHtml(parsed.thinking)}</div>` : ''}
             </div>
             <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:2px;">
-                ${action.type !== 'none' ? `<button class="ds-btn ds-btn-fill" id="ds-single-apply-btn">✅ 一键点选/填入本题</button>` : ''}
-                <button class="ds-btn ds-btn-accent" id="ds-single-r1-btn">🔄 R1重新深度演算</button>
+                ${canApply ? `<button class="ds-btn ds-btn-fill" id="ds-single-apply-btn">✅ 一键点选/填入本题</button>` : ''}
+                ${copyableText ? `<button class="ds-btn" id="ds-single-copy-btn">📋 复制答案</button>` : ''}
+                <button class="ds-btn ds-btn-accent" id="ds-single-r1-btn">🔄 R1重算</button>
             </div>
         `;
 
@@ -2572,15 +2668,35 @@
                     }
                     applyBtn.innerText = '✅ 已自动点选';
                 } else if (action.type === 'input') {
-                    for (let k = 0; k < qObj.inputs.length; k++) {
-                        const val = action.ansTexts[k] ?? action.ansTexts[0];
-                        if (val !== undefined) {
-                            qObj.inputs[k].focus();
-                            setNativeInputValue(qObj.inputs[k], String(val).trim());
-                            qObj.inputs[k].classList.add('ds-correct-highlight');
+                    if (isEssay) {
+                        const inp = qObj.inputs[0];
+                        inp.focus();
+                        setNativeInputValue(inp, action.ansTexts.join('\n'), true);
+                        inp.classList.add('ds-correct-highlight');
+                    } else {
+                        for (let k = 0; k < qObj.inputs.length; k++) {
+                            const val = action.ansTexts[k] ?? action.ansTexts[0];
+                            if (val !== undefined) {
+                                qObj.inputs[k].focus();
+                                setNativeInputValue(qObj.inputs[k], String(val).trim(), false);
+                                qObj.inputs[k].classList.add('ds-correct-highlight');
+                            }
                         }
                     }
                     applyBtn.innerText = '✅ 已自动填入';
+                }
+            });
+        }
+
+        const copyBtn = ui.contentBox.querySelector('#ds-single-copy-btn');
+        if (copyBtn) {
+            copyBtn.addEventListener('click', async () => {
+                try {
+                    await navigator.clipboard.writeText(copyableText);
+                    copyBtn.innerText = '✅ 已复制';
+                    setTimeout(() => { copyBtn.innerText = '📋 复制答案'; }, 1200);
+                } catch (_) {
+                    prompt('复制以下解答内容：', copyableText);
                 }
             });
         }
@@ -2664,25 +2780,35 @@
         }
     });
 
-    function setNativeInputValue(el, val) {
+    function setNativeInputValue(el, val, isEssay = false) {
         if (!el) return;
+        const textVal = String(val ?? '');
         try {
-            el.dispatchEvent(new InputEvent('beforeinput', { inputType: 'insertText', data: val, bubbles: true }));
+            el.dispatchEvent(new InputEvent('beforeinput', { inputType: 'insertText', data: textVal, bubbles: true }));
         } catch (_) {}
         if (el.isContentEditable) {
-            el.innerText = val;
+            if (isEssay && textVal.includes('\n')) {
+                el.innerHTML = textVal
+                    .split(/\r?\n/)
+                    .map(line => `<p>${escapeHtml(line) || '<br>'}</p>`)
+                    .join('');
+            } else {
+                el.innerText = textVal;
+            }
         } else {
             const proto = el.tagName === 'TEXTAREA' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
             const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
-            if (setter) setter.call(el, val);
-            else el.value = val;
+            if (setter) setter.call(el, textVal);
+            else el.value = textVal;
         }
         try {
-            el.dispatchEvent(new InputEvent('input', { inputType: 'insertText', data: val, bubbles: true }));
+            el.dispatchEvent(new InputEvent('input', { inputType: 'insertText', data: textVal, bubbles: true }));
         } catch (_) {
             el.dispatchEvent(new Event('input', { bubbles: true }));
         }
+        try { el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: ' ' })); } catch (_) {}
         el.dispatchEvent(new Event('change', { bubbles: true }));
+        try { el.dispatchEvent(new Event('blur', { bubbles: true })); } catch (_) {}
     }
 
     function escapeHtml(str) {
