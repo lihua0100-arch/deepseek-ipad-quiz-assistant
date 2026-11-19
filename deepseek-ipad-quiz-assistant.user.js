@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name    DeepSeek 智能题库助手 (iPad 学习通/U校园/全平台触屏通用版)
 // @namespace    https://tampermonkey.net/
-// @version      3.5.0
+// @version      3.6.0
 // @updateURL    https://raw.githubusercontent.com/lihua0100-arch/deepseek-ipad-quiz-assistant/main/deepseek-ipad-quiz-assistant.user.js
 // @downloadURL  https://raw.githubusercontent.com/lihua0100-arch/deepseek-ipad-quiz-assistant/main/deepseek-ipad-quiz-assistant.user.js
-// @description  全面适配手机 / iPad Safari / Mac / PC（学习通、U校园、超星尔雅、雨课堂、智慧树）：1.高数专项引擎：无损提取 KaTeX/MathJax/MathML/上下标/公式图片 LaTeX，高数与计算题自动路由 DeepSeek-R1 深度推理+反向验算；2.普通题 V3+Bing/百度实时联网搜题(RAG)+全卷互证，低置信度自动升级 R1 复核；3.全新手机端底部自适应抽屉与防误触悬浮球，内置设置面板与一键重算！
+// @description  准确率优先旗舰版（适配手机 / iPad Safari / Mac / PC，支持学习通、U校园、超星尔雅、雨课堂、智慧树）：1.默认全题 DeepSeek-R1 深度推理+反向验算，针对高数、否定题、组合编号题、物理/专业公式题深度优化；2.无损提取 KaTeX/MathJax/MathML/上下标/公式图片 LaTeX，自动剔除“AI讲解”等干扰词；3.联网搜题独立限速队列+单题/连刷统一题干与会话缓存，彻底消除单次与连续答题不一致；4.内置一键查看/复制诊断日志面板！
 // @author       Gemini
 // @match        *://*/*
 // @allFrames    true
@@ -45,21 +45,23 @@
     const CONFIG = {
         apiUrl: 'https://api.deepseek.com/chat/completions',
         longPressDuration: 520,
-        concurrencyChat: 6,       // V3 极速并发数
-        concurrencyReasoner: 4,   // R1 深度推理并发数（兼顾速度与限流保护）
-        searchTimeoutMs: 3200,    // 联网搜索超时（毫秒）
-        chatTimeoutMs: 38000,     // V3 请求超时
-        reasonerTimeoutMs: 98000, // R1 深度推理超时（高数多步验算需要更充裕时间）
+        concurrencyChat: 4,       // V3 并发数
+        concurrencyReasoner: 3,   // R1 深度推理并发数（稳健防限流，优先保证准确率）
+        searchConcurrency: 2,     // 联网搜题独立限速并发数（防止 12 并发被 Bing/百度封杀导致单题与连刷不一致）
+        searchIntervalMs: 180,    // 联网搜题错峰间隔
+        searchTimeoutMs: 4200,    // 联网搜索超时（毫秒）
+        chatTimeoutMs: 40000,     // V3 请求超时
+        reasonerTimeoutMs: 110000,// R1 深度推理超时（高数/复杂题充裕验算时间）
         maxRetries: 2,            // 遇到 429 / 5xx / 网络波动自动重试次数
-        autoEscalateThreshold: 0.78 // 智能模式下，V3 置信度低于此值自动升级 R1 复核
+        autoEscalateThreshold: 0.85
     };
 
-    const MODEL_MODES = ['auto', 'deepseek-reasoner', 'deepseek-chat'];
+    const MODEL_MODES = ['deepseek-reasoner', 'auto', 'deepseek-chat'];
 
     function loadSavedModelMode() {
-        const v35 = GM_getValue('DEEPSEEK_MODEL_V35', '');
-        if (MODEL_MODES.includes(v35)) return v35;
-        return 'auto'; // v3.5 默认开启【智能路由：高数/疑难题自动 R1，普通题 V3+联网】
+        const v36 = GM_getValue('DEEPSEEK_MODEL_V36', '');
+        if (MODEL_MODES.includes(v36)) return v36;
+        return 'deepseek-reasoner'; // v3.6 准确率优先：默认全题走 R1 深度推理 + 联网核对
     }
 
     const STATE = {
@@ -67,6 +69,9 @@
         modelMode: loadSavedModelMode(),
         webSearchEnabled: GM_getValue('DEEPSEEK_WEB_SEARCH', true),
         verifiedBank: GM_getValue('DEEPSEEK_VERIFIED_BANK', {}),
+        sessionCache: new Map(),  // 页面会话级结果缓存，保证单题与连刷 100% 一致
+        searchCache: new Map(),   // 联网搜题结果缓存，避免重复搜索被限流
+        logs: [],                 // 内置诊断日志
         isAnalyzing: false,
         isBatchRunning: false,
         stopBatchRequested: false,
@@ -75,24 +80,44 @@
         lastMousePos: { x: window.innerWidth / 2, y: window.innerHeight / 2 }
     };
 
+    function addLog(entry) {
+        const now = new Date();
+        const ts = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}:${String(now.getSeconds()).padStart(2, '0')}`;
+        STATE.logs.unshift(Object.assign({ ts }, entry));
+        if (STATE.logs.length > 120) STATE.logs.length = 120;
+        const ui = getUIElements();
+        if (ui.logPanel && ui.logPanel.classList.contains('ds-show')) {
+            renderLogPanel();
+        }
+    }
+
     function getModelModeLabel(mode = STATE.modelMode) {
-        if (mode === 'auto') return '🧠 智能(高数R1)';
-        if (mode === 'deepseek-reasoner') return '🔬 强制R1深度';
+        if (mode === 'deepseek-reasoner') return '🔬 全题R1(最高准)';
+        if (mode === 'auto') return '🧠 智能分流';
         return '⚡ V3极速';
     }
 
-    // 新版题干归一化键：保留数学运算符号（+ - * / ^ = < > √ ∫ ∑ ∞），防止高数中 f(x) 与 f(-x) 撞键
-    function normalizeStemKey(text) {
+    // 统一清理平台干扰词（如学习通题干右侧的“AI讲解”按钮文字）
+    function stripPlatformNoiseText(text) {
         return String(text || '')
+            .replace(/\bAI\s*讲解/gi, ' ')
+            .replace(/(?:查看解析|收藏本题|纠错|记笔记)\s*$/g, '')
+            .replace(/[ \t\r\n]+/g, ' ')
+            .trim();
+    }
+
+    // 新版题干归一化键：保留数学运算符号（+ - * / ^ = < > √ ∫ ∑ ∞），防止高数 f(x) 与 f(-x) 撞键
+    function normalizeStemKey(text) {
+        return stripPlatformNoiseText(text)
             .replace(/^\s*\d+[.、\s)）]*/, '')
-            .replace(/\(\s*[单多判填简计算证明]选题?.*?\)/g, '')
+            .replace(/[（(]\s*[单多判填简计算证明]选题?[^)）]*[)）]/g, '')
             .replace(/[\s_—，。；：？！、,.?;:!（）【】\[\]"'“”‘’$]/g, '')
             .slice(0, 100);
     }
 
     // 兼容 3.4 及以前版本的旧题库键，确保已记忆的满分题库无缝命中
     function normalizeLegacyStemKey(text) {
-        return String(text || '')
+        return stripPlatformNoiseText(text)
             .replace(/^\s*\d+[.、\s)）]*/, '')
             .replace(/\([单多判填简]选题.*?\)/g, '')
             .replace(/[\s_—\-，。；：？！、,.?;:!()（）【】\[\]"'“”‘’]/g, '')
@@ -121,7 +146,6 @@
         const tag = (node.localName || node.tagName || '').toLowerCase();
         if (tag === 'annotation' || tag === 'annotation-xml') return '';
 
-        // 如果 MathML 内自带 TeX annotation，直接返回最精准的原生 LaTeX
         if (tag === 'semantics') {
             const ann = node.querySelector('annotation[encoding*="tex"], annotation[encoding*="latex"]');
             if (ann && ann.textContent && ann.textContent.trim()) {
@@ -259,8 +283,7 @@
     }
 
     /**
-     * 无损提取含高等数学公式的节点文本：
-     * 支持 KaTeX / MathJax v2 & v3 / MathML / Quill Formula / HTML sup & sub / 公式 img
+     * 无损提取含高等数学公式的节点文本，并自动剔除“AI讲解”等平台按钮噪声
      */
     function extractRichMathText(node) {
         if (!node) return '';
@@ -272,8 +295,13 @@
             el.replaceWith(doc.createTextNode(text));
         };
 
-        // 1. 移除干扰与不可见元素（保留 script[type^="math/tex"]）
-        clone.querySelectorAll('style, noscript, .ans-icon, .font-cxsecret-ignore, .marking_duigou, .marking_cuowu').forEach(el => el.remove());
+        // 1. 移除干扰与不可见元素（含平台 AI讲解 按钮，保留 script[type^="math/tex"]）
+        clone.querySelectorAll('style, noscript, .ans-icon, .font-cxsecret-ignore, .marking_duigou, .marking_cuowu, [class*="ai-explain"], [class*="aiExplain"], [class*="ai_explain"]').forEach(el => el.remove());
+        clone.querySelectorAll('button, a, span, div').forEach(el => {
+            if (el.children.length <= 2 && /^\s*(AI\s*讲解|查看解析|收藏|纠错)\s*$/i.test(el.textContent || '')) {
+                el.remove();
+            }
+        });
         clone.querySelectorAll('script').forEach(sc => {
             const t = (sc.getAttribute('type') || '').toLowerCase();
             if (!t.startsWith('math/tex') && !t.startsWith('math/mml')) {
@@ -281,7 +309,7 @@
             }
         });
 
-        // 2. 处理 KaTeX（优先读取原生 application/x-tex 注解，避免分子分母错位和重复）
+        // 2. 处理 KaTeX
         clone.querySelectorAll('.katex-display, .katex').forEach(el => {
             if (!el.isConnected) return;
             const ann = el.querySelector('annotation[encoding*="tex"], annotation[encoding*="latex"]');
@@ -309,7 +337,7 @@
             el.querySelectorAll('mjx-assistive-mml').forEach(a => a.remove());
         });
 
-        // 4. 处理 MathJax v2 (script[type^="math/tex"] + .MathJax)
+        // 4. 处理 MathJax v2
         clone.querySelectorAll('script[type^="math/tex"]').forEach(sc => {
             const tex = (sc.textContent || '').trim();
             if (tex) {
@@ -354,7 +382,7 @@
             }
         });
 
-        // 8. 处理 HTML <sup> / <sub>（自内向外处理，防止嵌套错乱）
+        // 8. 处理 HTML <sup> / <sub>
         const supSubNodes = Array.from(clone.querySelectorAll('sup, sub')).reverse();
         for (const el of supSubNodes) {
             if (!el.isConnected) continue;
@@ -364,33 +392,25 @@
             replaceWithText(el, inner.length === 1 ? `${prefix}${inner}` : `${prefix}{${inner}}`);
         }
 
-        // 9. 读取最终文本并清理零宽字符与多余空白
+        // 9. 读取最终文本并清理零宽字符与平台噪声
         const raw = (clone.textContent || '')
             .replace(/[\u200B-\u200D\uFEFF]/g, '')
-            .replace(/\u00A0/g, ' ')
-            .replace(/[ \t\r\n]+/g, ' ')
-            .trim();
-        return raw;
+            .replace(/\u00A0/g, ' ');
+        return stripPlatformNoiseText(raw);
     }
 
-    /**
-     * 精准识别高等数学 / 线性代数 / 概率论 / 数学计算推导题
-     */
     function isMathQuestion(stemText, optionsList = []) {
         const combined = `${stemText || ''} ${(optionsList || []).map(o => o.cleanContent || o.text || '').join(' ')}`;
 
-        // 1. LaTeX 公式命令或明显数学符号
         if (/\\(frac|int|lim|sum|prod|sqrt|sin|cos|tan|cot|sec|csc|arcsin|arccos|arctan|ln|log|exp|infty|to|rightarrow|partial|nabla|cdot|times|leq|geq|neq|approx|equiv|alpha|beta|gamma|delta|theta|lambda|mu|sigma|phi|omega|pi|Delta|Sigma|Omega|begin\{matrix\})/i.test(combined)) {
             return true;
         }
         if (/[∫∬∭∮∑∏∂∇∞√≤≥≠≈≡∈∉⊂⊆∪∩∀∃⇒⇔]/.test(combined)) {
             return true;
         }
-        // 2. 高数/线代/概率论核心关键词
         if (/(高等数学|高数|微积分|极限|求导|导数|高阶导|隐函数|参数方程求导|微分|偏导|全微分|方向导数|梯度|散度|旋度|原函数|不定积分|定积分|反常积分|广义积分|二重积分|三重积分|曲线积分|曲面积分|格林公式|高斯公式|斯托克斯|级数|收敛|发散|收敛域|收敛半径|幂级数|傅里叶|泰勒|麦克劳林|洛必达|罗尔定理|拉格朗日|柯西中值|中值定理|间断点|可去间断|跳跃间断|无穷间断|连续性|可导|可微|拐点|凹凸性|极值|驻点|渐近线|切线方程|法线方程|曲率|微分方程|通解|特解|齐次|非齐次|特征方程|等价无穷小|无穷小|无穷大|矩阵|行列式|秩|特征值|特征向量|线性相关|线性无关|极大无关组|向量空间|二次型|正定|逆矩阵|伴随矩阵|随机变量|概率密度|分布函数|数学期望|方差|协方差|正态分布|泊松分布|二项分布|指数分布|均匀分布|中心极限定理|大数定律|参数估计|极大似然|假设检验)/.test(combined)) {
             return true;
         }
-        // 3. 常见数学表达式模式（如 f(x), f'(x), y'', dx, dy, sinx, e^x, x->0）
         if (/\b(f\s*['′″]?\s*\([a-z,\s]+\)|y\s*['′″]+|d[xyzt]\s*\/\s*d[xyzt]|lim\s*[\(_]?[a-z]|sin\s*[a-z(]|cos\s*[a-z(]|tan\s*[a-z(]|ln\s*[\|(x]|log_?\d*\s*\(|e\^\{?[-\w+]+|\^[{\-]?\d+|_[{\-]?\d+)/i.test(combined)) {
             return true;
         }
@@ -400,24 +420,70 @@
         return false;
     }
 
+    function isComplexReasoningQuestion(stemText, optionsList = []) {
+        const combined = `${stemText || ''} ${(optionsList || []).map(o => o.cleanContent || '').join(' ')}`;
+        // 否定题、组合编号题、物理/工程稳性计算题、多选题 -> 均需深度推理
+        if (/(不包括|不正确|错误的是|不属于|无关|不是|以下哪项不|不能|不恰当)/.test(stemText || '')) return true;
+        if (/[①②③④⑤]/.test(combined)) return true;
+        if (/(横倾角|倾侧力矩|初稳性高度|排水量|GM|KG|弯矩|剪力|稳性|浮心|重心|吃水|力矩|功率|电阻|压强|加速度|动量)/.test(combined)) return true;
+        if (/多选|多项|more than one|multiple/i.test(stemText || '')) return true;
+        return false;
+    }
+
     function isMaritimeQuestion(stemText, optionsList = []) {
         const combined = `${stemText || ''} ${(optionsList || []).map(o => o.cleanContent || '').join(' ')}`;
-        return /(集装箱|散装|散货|IMSBC|箱位|船舶|横倾|配载|岸桥|舱内|甲板|1CC|1AA|种子饼|平舱)/i.test(combined);
+        return /(集装箱|散装|散货|散粮|谷物|围井|IMSBC|箱位|船舶|横倾|初稳性|配载|岸桥|舱内|甲板|底舱|二层舱|积载因数|下沉性|止移|1CC|1AA|种子饼|平舱)/i.test(combined);
     }
 
     /********************************************************************
-     * 3. 实时联网搜题引擎 (Web Search RAG via GM_xmlhttpRequest)
+     * 3. 限速队列式实时联网搜题引擎 (Rate-Limited Web Search RAG)
+     * 彻底解决连刷时 12 路并发轰炸 Bing/百度被限流超时导致单题与连刷不一致的问题
      ********************************************************************/
+    const searchQueue = {
+        active: 0,
+        pending: [],
+        lastDispatchAt: 0
+    };
+
+    function runInSearchQueue(taskFn) {
+        return new Promise((resolve) => {
+            const execute = async () => {
+                searchQueue.active++;
+                const waitGap = Math.max(0, CONFIG.searchIntervalMs - (Date.now() - searchQueue.lastDispatchAt));
+                if (waitGap > 0) await sleep(waitGap);
+                searchQueue.lastDispatchAt = Date.now();
+                try {
+                    resolve(await taskFn());
+                } catch (_) {
+                    resolve({ clues: '', count: 0, status: 'error' });
+                } finally {
+                    searchQueue.active--;
+                    if (searchQueue.pending.length > 0) {
+                        const next = searchQueue.pending.shift();
+                        next();
+                    }
+                }
+            };
+
+            if (searchQueue.active < CONFIG.searchConcurrency) {
+                execute();
+            } else {
+                searchQueue.pending.push(execute);
+            }
+        });
+    }
+
     function cleanSearchQuery(stemText) {
-        return String(stemText || '')
+        return stripPlatformNoiseText(stemText)
             .replace(/^\s*\d+[.、\s)）]*/, '')
-            .replace(/\(\s*[单多判填简计算]选题?[^)]*\)/g, '')
+            .replace(/[（(]\s*[单多判填简计算]选题?[^)）]*[)）]/g, '')
             .replace(/\[\[.*?\]\]/g, ' ')
             .replace(/\$+/g, ' ')
             .replace(/_{2,}/g, ' ')
+            .replace(/[①②③④⑤⑥⑦⑧⑨⑩]/g, ' ')
             .replace(/\s+/g, ' ')
             .trim()
-            .slice(0, 72);
+            .slice(0, 68);
     }
 
     function fetchUrlTextWithTimeout(url, timeoutMs = CONFIG.searchTimeoutMs) {
@@ -481,7 +547,7 @@
         const nodes = doc.querySelectorAll(selectors.join(','));
         for (const node of nodes) {
             const txt = (node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim();
-            if (txt.length >= 20 && txt.length <= 450 && !snippets.includes(txt)) {
+            if (txt.length >= 20 && txt.length <= 480 && !snippets.includes(txt)) {
                 snippets.push(txt);
             }
             if (snippets.length >= 5) break;
@@ -490,31 +556,56 @@
     }
 
     async function searchWebForQuestionClues(stemText, optionsList = [], isMath = false) {
-        if (!STATE.webSearchEnabled) return '';
-        // 纯符号高数计算题联网容易搜到系数/符号不同的近似题产生误导，直接走 R1 独立推导更准更快
+        if (!STATE.webSearchEnabled) {
+            return { clues: '', count: 0, status: 'disabled' };
+        }
         const query = cleanSearchQuery(stemText);
-        if (query.length < 6) return '';
+        if (query.length < 6) {
+            return { clues: '', count: 0, status: 'too-short' };
+        }
+        // 纯符号高数计算题跳过网搜，避免搜到正负号/系数不同的近似题产生误导
         if (isMath && (query.replace(/[^a-zA-Z0-9\\^_{}()+\-*/=]/g, '').length / Math.max(1, query.length) > 0.55)) {
-            return '';
+            return { clues: '', count: 0, status: 'skipped-math' };
         }
 
-        const optKeywords = optionsList.slice(0, 4).map(o => o.cleanContent).join(' ').replace(/\$+/g, '');
-        const fullQuery = `${query} ${optKeywords}`.slice(0, 95);
+        const cacheKey = normalizeStemKey(stemText);
+        if (cacheKey && STATE.searchCache.has(cacheKey)) {
+            return STATE.searchCache.get(cacheKey);
+        }
 
-        const bingUrl = `https://cn.bing.com/search?q=${encodeURIComponent(fullQuery)}`;
-        const baiduUrl = `https://www.baidu.com/s?wd=${encodeURIComponent(query)}&rn=5`;
+        const result = await runInSearchQueue(async () => {
+            // 如果题干较短，附带前2个非编号选项词提升精准命中率；题干本身已含丰富关键词则直接搜纯题干
+            const nonNumOpts = optionsList
+                .map(o => o.cleanContent.replace(/[①②③④⑤⑥⑦⑧⑨⑩\$]/g, '').trim())
+                .filter(s => s.length >= 2 && s.length <= 24)
+                .slice(0, 2)
+                .join(' ');
+            const bingQuery = (query.length < 28 && nonNumOpts) ? `${query} ${nonNumOpts}`.slice(0, 82) : query;
 
-        const [bingHtml, baiduHtml] = await Promise.all([
-            fetchUrlTextWithTimeout(bingUrl, CONFIG.searchTimeoutMs),
-            fetchUrlTextWithTimeout(baiduUrl, CONFIG.searchTimeoutMs)
-        ]);
+            const bingUrl = `https://cn.bing.com/search?q=${encodeURIComponent(bingQuery)}`;
+            const baiduUrl = `https://www.baidu.com/s?wd=${encodeURIComponent(query)}&rn=5`;
 
-        const combinedSnippets = [
-            ...parseSearchSnippetsFromHTML(bingHtml),
-            ...parseSearchSnippetsFromHTML(baiduHtml)
-        ].slice(0, 6);
+            const [bingHtml, baiduHtml] = await Promise.all([
+                fetchUrlTextWithTimeout(bingUrl, CONFIG.searchTimeoutMs),
+                fetchUrlTextWithTimeout(baiduUrl, CONFIG.searchTimeoutMs)
+            ]);
 
-        return combinedSnippets.join('\n---\n').slice(0, 1600);
+            const combinedSnippets = [
+                ...parseSearchSnippetsFromHTML(bingHtml),
+                ...parseSearchSnippetsFromHTML(baiduHtml)
+            ].slice(0, 6);
+
+            return {
+                clues: combinedSnippets.join('\n---\n').slice(0, 1800),
+                count: combinedSnippets.length,
+                status: combinedSnippets.length > 0 ? 'hit' : 'miss'
+            };
+        });
+
+        if (cacheKey) {
+            STATE.searchCache.set(cacheKey, result);
+        }
+        return result;
     }
 
     /********************************************************************
@@ -578,7 +669,7 @@
     injectMainWorldBridge();
 
     /********************************************************************
-     * 5. 手机 + iPad + PC 响应式 UI 样式
+     * 5. 手机 + iPad + PC 响应式 UI 样式（含内置日志面板）
      ********************************************************************/
     const isTopFrame = window.self === window.top;
 
@@ -645,9 +736,9 @@
             position: fixed;
             right: max(16px, env(safe-area-inset-right, 0px));
             bottom: calc(24px + env(safe-area-inset-bottom, 0px));
-            width: 376px;
+            width: 384px;
             max-width: calc(100vw - 24px);
-            max-height: 70vh;
+            max-height: 72vh;
             background: rgba(15, 23, 42, 0.96);
             color: #f8fafc;
             border-radius: 16px;
@@ -724,17 +815,36 @@
             padding-right: 2px;
         }
 
-        #ds-settings-panel {
+        .ds-subpanel {
             display: none;
-            background: rgba(30, 41, 59, 0.9);
+            background: rgba(30, 41, 59, 0.92);
             border: 1px solid rgba(56, 189, 248, 0.35);
             border-radius: 10px;
             padding: 10px;
             margin-bottom: 8px;
             flex-shrink: 0;
         }
-        #ds-settings-panel.ds-show {
+        .ds-subpanel.ds-show {
             display: block;
+        }
+        #ds-log-list {
+            max-height: 180px;
+            overflow-y: auto;
+            -webkit-overflow-scrolling: touch;
+            font-size: 11px;
+            color: #cbd5e1;
+            margin-top: 6px;
+            display: flex;
+            flex-direction: column;
+            gap: 5px;
+        }
+        .ds-log-item {
+            background: rgba(15, 23, 42, 0.78);
+            border-left: 2px solid #38bdf8;
+            border-radius: 6px;
+            padding: 5px 7px;
+            word-break: break-word;
+            line-height: 1.4;
         }
         .ds-setting-row {
             display: flex;
@@ -768,7 +878,7 @@
         .ds-answer-meta {
             display: flex;
             flex-wrap: wrap;
-            gap: 6px;
+            gap: 5px;
             align-items: center;
             font-size: 11px;
             color: #94a3b8;
@@ -879,7 +989,6 @@
             border-radius: 6px !important;
         }
 
-        /* 手机端窄屏自适应：底部抽屉卡片 + 紧凑悬浮球 + 大触控区 */
         @media (max-width: 640px) {
             #ds-fab {
                 width: 48px;
@@ -894,7 +1003,7 @@
                 width: auto;
                 max-width: none;
                 bottom: calc(8px + env(safe-area-inset-bottom, 0px));
-                max-height: 58vh;
+                max-height: 60vh;
                 padding: 10px 12px;
                 border-radius: 16px;
             }
@@ -927,6 +1036,8 @@
                 contentBox: topDoc.getElementById('ds-card-content'),
                 footerBox: topDoc.getElementById('ds-card-footer'),
                 settingsPanel: topDoc.getElementById('ds-settings-panel'),
+                logPanel: topDoc.getElementById('ds-log-panel'),
+                logList: topDoc.getElementById('ds-log-list'),
                 apiKeyInput: topDoc.getElementById('ds-apikey-input'),
                 bankCountEl: topDoc.getElementById('ds-bank-count'),
                 sweepBtn: topDoc.getElementById('ds-btn-autosweep'),
@@ -940,6 +1051,8 @@
                 contentBox: document.getElementById('ds-card-content'),
                 footerBox: document.getElementById('ds-card-footer'),
                 settingsPanel: document.getElementById('ds-settings-panel'),
+                logPanel: document.getElementById('ds-log-panel'),
+                logList: document.getElementById('ds-log-list'),
                 apiKeyInput: document.getElementById('ds-apikey-input'),
                 bankCountEl: document.getElementById('ds-bank-count'),
                 sweepBtn: document.getElementById('ds-btn-autosweep'),
@@ -959,12 +1072,33 @@
         if (card) card.classList.remove('ds-open');
     }
 
+    function renderLogPanel() {
+        const { logList } = getUIElements();
+        if (!logList) return;
+        if (STATE.logs.length === 0) {
+            logList.innerHTML = `<div style="color:#64748b;">暂无答题日志，开始答题后会自动记录每题的模型、网搜命中数与耗时。</div>`;
+            return;
+        }
+        logList.innerHTML = STATE.logs.map(l => `
+            <div class="ds-log-item">
+                <div><b>[${escapeHtml(l.ts)}] ${escapeHtml(l.scene)}</b> · ${escapeHtml(l.model)} · 网搜:${escapeHtml(l.web)} · ${l.ms}ms</div>
+                <div style="color:#94a3b8;">题：${escapeHtml(l.stem)}</div>
+                <div style="color:#34d399;">答：${escapeHtml(l.answer)}</div>
+            </div>
+        `).join('');
+    }
+
+    function formatLogsAsText() {
+        return STATE.logs.map(l =>
+            `[${l.ts}][${l.scene}] 模型=${l.model} 网搜=${l.web} 耗时=${l.ms}ms | 题=${l.stem} | 答=${l.answer} | 思路=${l.thinking || ''}`
+        ).join('\n');
+    }
+
     function openSettingsInCard(tipMsg = '') {
         const ui = getUIElements();
         showCard();
-        if (ui.settingsPanel) {
-            ui.settingsPanel.classList.add('ds-show');
-        }
+        if (ui.logPanel) ui.logPanel.classList.remove('ds-show');
+        if (ui.settingsPanel) ui.settingsPanel.classList.add('ds-show');
         if (ui.apiKeyInput) {
             ui.apiKeyInput.value = STATE.apiKey || '';
             setTimeout(() => { try { ui.apiKeyInput.focus(); } catch (_) {} }, 80);
@@ -980,7 +1114,6 @@
 
     function ensureApiKeyReady() {
         if (STATE.apiKey && STATE.apiKey.trim()) return true;
-        // 手机端优先打开内置设置面板输入 Key，避免移动浏览器拦截 window.prompt
         if (isCompactViewport()) {
             openSettingsInCard('🔑 请先在上方输入您的 DeepSeek API Key (sk-...) 并点击保存。');
             return false;
@@ -1012,20 +1145,31 @@
         fabEl = document.createElement('div');
         fabEl.id = 'ds-fab';
         fabEl.innerHTML = '🎯';
-        fabEl.title = '轻点1下：高数/联网解析单题 | 长按或连点3下：全卷高准自动连刷！';
+        fabEl.title = '轻点1下：R1深度解析单题 | 长按或连点3下：全卷最高准自动连刷！';
         document.body.appendChild(fabEl);
 
         cardEl = document.createElement('div');
         cardEl.id = 'ds-card';
         cardEl.innerHTML = `
             <div class="ds-card-header">
-                <span class="ds-card-title">📐 DeepSeek 题库助手 3.5 (高数+手机增强)</span>
+                <span class="ds-card-title">🔬 DeepSeek 题库助手 3.6 (准确率优先)</span>
                 <span class="ds-header-icons">
+                    <button class="ds-icon-btn" id="ds-card-log-btn" title="查看/复制诊断日志">📋</button>
                     <button class="ds-icon-btn" id="ds-card-settings-btn" title="设置 API Key 与题库">⚙️</button>
                     <button class="ds-icon-btn" id="ds-card-close-btn" title="关闭">✕</button>
                 </span>
             </div>
-            <div id="ds-settings-panel">
+            <div class="ds-subpanel" id="ds-log-panel">
+                <div style="display:flex;justify-content:space-between;align-items:center;font-size:12px;color:#38bdf8;">
+                    <b>📋 答题诊断日志（模型 / 网搜 / 耗时）</b>
+                    <span style="display:flex;gap:4px;">
+                        <button class="ds-btn" id="ds-log-copy-btn" style="flex:0 0 auto;min-height:26px;padding:2px 8px;font-size:11px;">复制日志</button>
+                        <button class="ds-btn" id="ds-log-clear-btn" style="flex:0 0 auto;min-height:26px;padding:2px 8px;font-size:11px;">清空</button>
+                    </span>
+                </div>
+                <div id="ds-log-list"></div>
+            </div>
+            <div class="ds-subpanel" id="ds-settings-panel">
                 <div style="font-size:12px;color:#94a3b8;">DeepSeek API Key（保存在本地油猴存储，跨版本保留）：</div>
                 <div class="ds-setting-row">
                     <input class="ds-input" id="ds-apikey-input" type="password" placeholder="sk-..." autocomplete="off" />
@@ -1033,14 +1177,17 @@
                 </div>
                 <div class="ds-setting-row" style="justify-content:space-between;margin-top:8px;font-size:11.5px;color:#94a3b8;">
                     <span>本地已记忆题库：<b id="ds-bank-count" style="color:#38bdf8;">0</b> 题</span>
-                    <button class="ds-btn" id="ds-bank-clear-btn" style="flex:0 0 auto;min-height:28px;padding:3px 8px;font-size:11px;">清空记忆库</button>
+                    <span style="display:flex;gap:4px;">
+                        <button class="ds-btn" id="ds-cache-clear-btn" style="flex:0 0 auto;min-height:28px;padding:3px 8px;font-size:11px;">清本页缓存</button>
+                        <button class="ds-btn" id="ds-bank-clear-btn" style="flex:0 0 auto;min-height:28px;padding:3px 8px;font-size:11px;">清记忆库</button>
+                    </span>
                 </div>
             </div>
             <div id="ds-card-content">
                 <div style="color:#cbd5e1;font-size:12px;line-height:1.6;">
-                    • <b>轻点 1 下 🎯</b>：解析当前题目（高数自动提取公式并启动 <b>R1 深度验算</b>）<br>
-                    • <b>长按 🎯 或 连点 3 下 🎯</b>：全卷高准自动连刷（高数 R1 + 普通题联网互证）<br>
-                    • <b>拖动 🎯</b>：可自由挪动悬浮球位置，不遮挡手机选项
+                    • <b>默认全题 DeepSeek-R1 深度推理 + 限速防封联网搜题</b>，优先保证最高正确率！<br>
+                    • <b>轻点 1 下 🎯</b>：解析当前题目（与连刷共用同一套题干和结果缓存，杜绝前后不一致）<br>
+                    • <b>长按 🎯 或 连点 3 下 🎯</b>：全卷 R1 深度高准自动连刷（右上角 📋 可看每题日志）
                 </div>
             </div>
             <div class="ds-card-actions" id="ds-card-footer">
@@ -1053,9 +1200,38 @@
 
         document.getElementById('ds-card-close-btn').addEventListener('click', hideCard);
 
+        document.getElementById('ds-card-log-btn').addEventListener('click', () => {
+            const logPanel = document.getElementById('ds-log-panel');
+            const settingsPanel = document.getElementById('ds-settings-panel');
+            if (!logPanel) return;
+            if (settingsPanel) settingsPanel.classList.remove('ds-show');
+            const willShow = !logPanel.classList.contains('ds-show');
+            logPanel.classList.toggle('ds-show', willShow);
+            if (willShow) renderLogPanel();
+        });
+
+        document.getElementById('ds-log-copy-btn').addEventListener('click', async (e) => {
+            const btn = e.currentTarget;
+            const txt = formatLogsAsText() || '暂无日志';
+            try {
+                await navigator.clipboard.writeText(txt);
+                btn.innerText = '已复制';
+                setTimeout(() => { btn.innerText = '复制日志'; }, 1200);
+            } catch (_) {
+                prompt('复制以下诊断日志：', txt);
+            }
+        });
+
+        document.getElementById('ds-log-clear-btn').addEventListener('click', () => {
+            STATE.logs = [];
+            renderLogPanel();
+        });
+
         document.getElementById('ds-card-settings-btn').addEventListener('click', () => {
             const panel = document.getElementById('ds-settings-panel');
+            const logPanel = document.getElementById('ds-log-panel');
             if (!panel) return;
+            if (logPanel) logPanel.classList.remove('ds-show');
             const willShow = !panel.classList.contains('ds-show');
             panel.classList.toggle('ds-show', willShow);
             if (willShow) {
@@ -1077,6 +1253,13 @@
             if (contentBox) {
                 contentBox.innerHTML = `<div class="ds-answer-box"><div class="ds-answer-main">✅ API Key 已保存</div><div class="ds-answer-sub">现在可轻点 🎯 解析单题，或长按 🎯 全卷连刷。</div></div>`;
             }
+        });
+
+        document.getElementById('ds-cache-clear-btn').addEventListener('click', (e) => {
+            STATE.sessionCache.clear();
+            STATE.searchCache.clear();
+            e.currentTarget.innerText = '已清空';
+            setTimeout(() => { e.currentTarget.innerText = '清本页缓存'; }, 1000);
         });
 
         document.getElementById('ds-bank-clear-btn').addEventListener('click', () => {
@@ -1103,11 +1286,10 @@
         document.getElementById('ds-btn-switch-model').addEventListener('click', (e) => {
             const idx = MODEL_MODES.indexOf(STATE.modelMode);
             STATE.modelMode = MODEL_MODES[(idx + 1) % MODEL_MODES.length];
-            GM_setValue('DEEPSEEK_MODEL_V35', STATE.modelMode);
+            GM_setValue('DEEPSEEK_MODEL_V36', STATE.modelMode);
             e.currentTarget.innerText = getModelModeLabel(STATE.modelMode);
         });
 
-        // 注册油猴菜单命令（桌面/iPad 快捷入口）
         if (typeof GM_registerMenuCommand === 'function') {
             GM_registerMenuCommand('🔑 设置 DeepSeek API Key', () => openSettingsInCard('🔑 请在下方输入 DeepSeek API Key'));
             GM_registerMenuCommand('🚀 启动全卷高准自动全选', () => startFullPageAutoSweep());
@@ -1118,7 +1300,6 @@
             e.stopPropagation();
         });
 
-        // 手机端触控去重与流畅拖拽（修复 touchstart + 合成 mousedown 双重触发问题）
         let isPressing = false;
         let lastTouchTimestamp = 0;
         let startX = 0, startY = 0;
@@ -1198,7 +1379,7 @@
         window.addEventListener('touchcancel', onPointerEnd);
 
         fabEl.addEventListener('mousedown', (e) => {
-            if (Date.now() - lastTouchTimestamp < 600) return; // 忽略移动端合成鼠标事件
+            if (Date.now() - lastTouchTimestamp < 600) return;
             if (e.button === 0) {
                 onPointerStart(e.clientX, e.clientY);
             }
@@ -1415,7 +1596,6 @@
                     }
                 }
 
-                // 手机端底部有抽屉卡片，将题目滚到屏幕上方 22% 处，避免被卡片遮挡
                 const ratio = isCompactViewport() ? 0.22 : 0.34;
                 const targetViewportY = window.top.innerHeight * ratio;
                 const deltaY = totalTopOffset - targetViewportY;
@@ -1480,7 +1660,7 @@
     }
 
     /********************************************************************
-     * 8. 精准题目与选项提取器（支持高数公式无损还原）
+     * 8. 精准题目与选项提取器（单题与连刷完全统一）
      ********************************************************************/
     const STRICT_QUESTION_BLOCK_SELECTORS = [
         '.TiMu', '.singleQuesId', '.questionLi',
@@ -1681,11 +1861,9 @@
     }
 
     /********************************************************************
-     * 9. 高容错 JSON 解析器（彻底修复高数 LaTeX 反斜杠导致解析崩溃的 Bug）
+     * 9. 高容错 JSON 解析器（修复高数 LaTeX 反斜杠崩溃问题）
      ********************************************************************/
     function repairJsonBackslashes(str) {
-        // 将非合法 JSON 转义序列的单个反斜杠（如 \frac, \sin, \lim, \int, \pi, \to）修复为双反斜杠
-        // 注意：保留 \" \\ \/ \b \f \n \r \t \uXXXX，但对 \frac / \theta / \tau / \beta / \nu / \rho 等常见 LaTeX 词前缀也做转义保护
         return str
             .replace(/\\(frac|forall|beta|binom|bar|big|nabla|neq|nu|not|natural|rho|rightarrow|rangle|to|tan|theta|times|tilde|tau|text|triangle)/g, '\\\\$1')
             .replace(/\\(?!["\\/bfnrtu])/g, '\\\\')
@@ -1707,7 +1885,6 @@
             try {
                 parsed = JSON.parse(repairJsonBackslashes(candidate));
             } catch (__) {
-                // 终极正则兜底：即便 JSON 格式损坏，也绝不丢失已经算出的答案
                 const lettersMatch = cleaned.match(/"answerLetters"\s*:\s*\[([^\]]*)\]/i);
                 const textsMatch = cleaned.match(/"answerTexts"\s*:\s*\[([^\]]*)\]/i);
                 const thinkingMatch = cleaned.match(/"thinking"\s*:\s*"([\s\S]*?)"(?=\s*,\s*"|\s*})/);
@@ -1749,7 +1926,7 @@
     }
 
     /********************************************************************
-     * 10. 高数专项 + 智能路由 + 联网 RAG + 全卷互证 推理引擎
+     * 10. 准确率优先 R1 深度推理 + 联网 RAG + 全卷互证引擎
      ********************************************************************/
     function callDeepSeekAPIOnce(payload, timeoutMs) {
         return new Promise((resolve) => {
@@ -1778,15 +1955,15 @@
             if (res.ok) return res;
             const retryable = res.status === 0 || res.status === 408 || res.status === 429 || (res.status >= 500 && res.status < 600);
             if (!retryable || attempt === CONFIG.maxRetries) return res;
-            await sleep(700 * (attempt + 1));
+            await sleep(800 * (attempt + 1));
         }
         return { ok: false, status: 0, text: '' };
     }
 
     function buildSystemPrompt(isMath, isMaritime, blankCount) {
         const baseLines = [
-            '你是一位满分级高校学科与大学数学（高等数学、线性代数、概率论）解题专家。',
-            '核心目标：追求 100% 准确率，严禁凭感觉蒙题。'
+            '你是一位满分级高校学科、大学数学（高等数学/线代/概率）与海运/工程专业课解题专家。',
+            '核心目标：追求 100% 准确率，严禁凭第一直觉草率作答。'
         ];
 
         if (isMath) {
@@ -1795,32 +1972,35 @@
                 '【📐 高等数学与计算推导专项验算协议（必须严格执行）】：',
                 '1. 严谨分步求解：先明确定义域、连续性、可导性、收敛条件与积分上下限，再规范推导。',
                 '2. 强制反向验算（缺一不可）：',
-                '   - 不定积分：对所得原函数求导，核对是否完全还原被积函数（并注意常数 C）；',
-                '   - 定积分/重积分：核对对称区间奇偶性、换元后上下限是否同步变换、分部积分负号；',
+                '   - 不定积分：对所得原函数求导，核对是否完全还原被积函数（注意常数 C）；',
+                '   - 定积分/重积分：核对对称区间奇偶性、换元后上下限变换、分部积分负号；',
                 '   - 极限题：先判未定式类型（0/0、∞/∞、1^∞ 等），加减项中严禁盲目等价无穷小替换，优先用泰勒展开至足够阶数或洛必达法则交叉验算；',
                 '   - 微分方程：把通解/特解代回原方程及初值条件检验；',
-                '   - 级数题：先查通项极限是否为 0，再用比值/根值/比较/莱布尼茨判别法核对端点收敛性；',
+                '   - 级数题：先查通项极限是否为 0，再按比值/根值/比较/莱布尼茨判别法核对端点收敛性；',
                 '   - 极值/拐点/间断点/渐近线：严格区分必要条件与充分条件，检查导数变号与定义域边界；',
-                '   - 判断题：优先尝试构造高数经典反例（如 f(x)=|x| 连续不可导、调和级数 ∑1/n 发散、分段函数等）。',
-                '3. 选项逐字精校：算出最终结果后，逐一化简并与每个选项核对正负号、系数（如 1/2 与 2）、开闭区间 () 与 []，防止看错选项。',
-                '4. 联网提示警告：下方若附带联网搜索摘要，极可能是系数/符号不同的近似题，数学题严禁盲信网搜答案，必须以你独立演算与反向验算为准！'
+                '   - 判断题：优先尝试构造高数经典反例（如 f(x)=|x| 连续不可导、调和级数 ∑1/n 发散等）。',
+                '3. 选项逐字精校：算出最终结果后，逐一化简并与每个选项核对正负号、系数（如 1/2 与 2）、开闭区间 () 与 []。',
+                '4. 联网提示警告：若附带联网搜索摘要，数学题严禁盲信网搜答案，必须以你独立演算与反向验算为准！'
             );
         } else {
             baseLines.push(
                 '',
-                '【解题准则】：',
-                '1. 优先核对【🌐 实时联网搜题摘要】：若摘要中出现与本题完全一致的原题及权威答案，应高度参考；若题干存在关键词/否定词差异，必须以逻辑与教材为准。',
-                '2. 善用【📄 同卷其它题目互证摘要】：同一份试卷的前后题目常包含相同概念或数值线索，可交叉印证。',
-                '3. 多选题务必逐项审查，不漏选、不多选；判断题注意“一定/必须/所有/唯一”等绝对化陷阱词。'
+                '【🎯 通用与专业课高准解题协议（必须严格执行）】：',
+                '1. 否定题反查法：若题干含“不包括 / 不正确 / 无关 / 错误的是 / 不属于”，必须先逐一判定每个选项属于还是不属于，再反选唯一不符项！',
+                '2. 组合编号题逐条核验：若含 ①②③④⑤，必须逐条独立判断每一项是否成立，绝不能凭直觉漏掉教材列出的因素！',
+                '3. 隐含物理/工程公式必列式：若涉及稳性、横倾角、倾侧力矩、排水量、初稳性高度 GM、弯矩、力学等，必须先写出完整物理公式再判断各变量影响，严禁漏看未给定的变量！',
+                '4. 联网搜题与同卷互证：若【🌐 实时联网搜题摘要】中出现与本题一致的原题及教材答案，请高度重视并核对；同时务必结合【📄 同卷其它题目互证摘要】交叉印证（同卷邻题常直接揭示公式变量与专业定义）。',
+                '5. 多选题务必逐项审查，不漏选、不多选；判断题警惕“一定/必须/所有/唯一”等绝对化表述。'
             );
         }
 
         if (isMaritime) {
             baseLines.push(
                 '',
-                '【海运/集装箱与散货运输补充规则】：',
-                '- 6位箱位号 BBRRTT：前两位奇数排号(01,03,05...)为 20ft 箱且对应自首第 (BB+1)/2 排；中两位列号奇右偶左；后两位 <80 为舱内，>=80 为甲板。',
-                '- 两个 1CC(20ft) 长度之和比一个 1AA(40ft) 短；端门第 3 行标明总重和自重；超高标记数字为实际高度；双岸桥同时作业至少纵向间隔一个 40ft 行箱位。'
+                '【🚢 船舶货运 / 散装谷物 / 集装箱专业课权威核对要点】：',
+                '- 散装谷物横倾角公式：tanθ = M_h / (Δ · GM)（或近似 θ = 57.3·M_h / (Δ·GM)），横倾角与谷物倾侧力矩 M_h、排水量 Δ、初稳性高度 GM（及 KG）均有关，与谷物颗粒大小无关；M_h 和 Δ 相同时，GM 越小横倾角越大！',
+                '- 散装谷物下沉性影响因素：谷物表面状态、积载因数、含水量、颗粒大小、颗粒形状全部有关；围井作为止移装置应设在【二层舱舱口四周】；改善散装谷物船舶稳性的方法包括减少部分装载舱个数、将尺度较小的货舱用作部分装载舱、增加经平舱满载舱个数等（注意：按舱容比分配各舱质量是调整纵向强度/剪力弯矩，不是改善谷物稳性方法）。',
+                '- 6位箱位号 BBRRTT：前两位奇数排号(01,03,05...)为 20ft 箱且对应自首第 (BB+1)/2 排；中两位列号奇右偶左；后两位 <80 为舱内，>=80 为甲板；两个 1CC(20ft) 长度之和比一个 1AA(40ft) 短；双岸桥同时作业至少纵向间隔一个 40ft 行箱位。'
             );
         }
 
@@ -1833,10 +2013,10 @@
 
         baseLines.push(
             '',
-            '必须严格返回合法 JSON（不要包含 Markdown 代码块；JSON 字符串内的反斜杠请务必双写为 \\\\ 或直接用简洁 ASCII/Unicode 数学符号）：',
+            '必须严格返回合法 JSON（不要包含 Markdown 代码块；JSON 字符串内的反斜杠请双写为 \\\\ 或用简洁 ASCII/Unicode 数学符号）：',
             '{',
-            '  "thinking": "精炼的关键推导步骤与反向验算结论（不超过140字）",',
-            '  "answerLetters": ["正确选项大写字母，如 \\"C\\"；填空题可为空数组 []"],',
+            '  "thinking": "精炼的关键推导步骤、公式或教材依据与反向验算结论（不超过150字）",',
+            '  "answerLetters": ["正确选项大写字母，如 \\"D\\"；填空题可为空数组 []"],',
             '  "answerTexts": ["正确选项完整原文内容；填空题按空格顺序填写每个空的答案"],',
             '  "confidence": 0.95',
             '}'
@@ -1845,26 +2025,40 @@
         return baseLines.join('\n');
     }
 
-    async function requestSingleQuestionCoTAnalysis(q, paperContextSummary = '', overrideModel = null) {
+    async function requestSingleQuestionCoTAnalysis(q, paperContextSummary = '', options = {}) {
+        const { overrideModel = null, forceFresh = false, scene = '单题' } = options;
+        const startTime = Date.now();
         STATE.verifiedBank = GM_getValue('DEEPSEEK_VERIFIED_BANK', STATE.verifiedBank || {});
+        const stemKey = normalizeStemKey(q.stemText);
         const memoryEntry = lookupVerifiedBank(STATE.verifiedBank, q.stemText);
 
+        const isMath = isMathQuestion(q.stemText, q.options);
+        const isComplex = isComplexReasoningQuestion(q.stemText, q.options);
+        const isMaritime = !isMath && isMaritimeQuestion(q.stemText, q.options);
+
         // 1. 优先命中本地批改验证记忆库
-        if (!overrideModel && memoryEntry && Array.isArray(memoryEntry.correctLetters) && memoryEntry.correctLetters.length > 0) {
-            return {
+        if (!forceFresh && !overrideModel && memoryEntry && Array.isArray(memoryEntry.correctLetters) && memoryEntry.correctLetters.length > 0) {
+            const memRes = {
                 thinking: '📚 命中已验证满分题库记忆，直接锁定标准答案',
                 answerLetters: memoryEntry.correctLetters,
                 answerTexts: [],
                 confidence: 1.0,
                 usedModel: 'memory',
-                isMath: isMathQuestion(q.stemText, q.options)
+                isMath
             };
+            addLog({
+                scene,
+                model: '本地题库',
+                web: '跳过',
+                ms: Date.now() - startTime,
+                stem: q.stemText.slice(0, 36),
+                answer: memRes.answerLetters.join(''),
+                thinking: memRes.thinking
+            });
+            return memRes;
         }
 
-        const isMath = isMathQuestion(q.stemText, q.options);
-        const isMaritime = !isMath && isMaritimeQuestion(q.stemText, q.options);
-
-        // 决定本次调用模型：auto 模式下高数题自动走 deepseek-reasoner (R1)，普通题走 deepseek-chat (V3)
+        // 决定本次调用模型
         let useModel = overrideModel;
         if (!useModel) {
             if (STATE.modelMode === 'deepseek-reasoner') {
@@ -1872,12 +2066,29 @@
             } else if (STATE.modelMode === 'deepseek-chat') {
                 useModel = 'deepseek-chat';
             } else {
-                useModel = isMath ? 'deepseek-reasoner' : 'deepseek-chat';
+                useModel = (isMath || isComplex) ? 'deepseek-reasoner' : 'deepseek-chat';
             }
         }
 
-        // 2. 实时联网检索（纯符号高数题自动跳过噪声网搜，概念型高数题/普通题并发检索）
-        const webClues = await searchWebForQuestionClues(q.stemText, q.options, isMath);
+        // 2. 命中本页会话缓存（确保单题与连刷 100% 一致，不重复烧 Token）
+        const sessionKey = `${stemKey}::${useModel}`;
+        if (!forceFresh && stemKey && STATE.sessionCache.has(sessionKey)) {
+            const cached = STATE.sessionCache.get(sessionKey);
+            addLog({
+                scene,
+                model: `${cached.usedModel === 'deepseek-reasoner' ? 'R1' : 'V3'}(缓存)`,
+                web: cached.webCount ? `命中${cached.webCount}条` : '无',
+                ms: Date.now() - startTime,
+                stem: q.stemText.slice(0, 36),
+                answer: (cached.answerLetters || []).join('') || (cached.answerTexts || []).join('|'),
+                thinking: cached.thinking
+            });
+            return cached;
+        }
+
+        // 3. 限速队列实时联网检索
+        const searchRes = await searchWebForQuestionClues(q.stemText, q.options, isMath);
+        const webClues = searchRes.clues || '';
 
         const isMultiChoice = /多选|多项|more than one|multiple/i.test(q.stemText);
         const isTrueFalse = q.options.length === 2 && q.options.some(o => /对|错|正确|错误|true|false|√|×/i.test(o.text));
@@ -1901,7 +2112,7 @@
             `题目类型：${qTypeHint}${isMath ? '（高等数学/数学计算题）' : ''}`,
             `当前题干：${q.stemText}`,
             `候选选项：\n${formattedOptions}`,
-            webClues ? `【🌐 联网参考摘要${isMath ? '（仅供参考，数学题必须独立验算）' : ''}】：\n${webClues}` : '',
+            webClues ? `【🌐 联网参考摘要（共 ${searchRes.count} 条${isMath ? '，仅供参考，数学题必须独立验算' : ''}）】：\n${webClues}` : '',
             paperContextSummary ? `【📄 同卷其它题目互证摘要】：\n${paperContextSummary}` : '',
             wrongExclusionNote
         ].filter(Boolean).join('\n\n');
@@ -1923,13 +2134,23 @@
 
         let res = await callDeepSeekWithRetry(buildPayload(useModel), useModel);
 
-        // 若 R1 不可用或请求失败，优雅降级到 V3，绝不直接卡死
         if (!res.ok && useModel === 'deepseek-reasoner') {
             useModel = 'deepseek-chat';
             res = await callDeepSeekWithRetry(buildPayload(useModel), useModel);
         }
 
-        if (!res.ok) return null;
+        if (!res.ok) {
+            addLog({
+                scene,
+                model: useModel === 'deepseek-reasoner' ? 'R1(失败)' : 'V3(失败)',
+                web: searchRes.count > 0 ? `命中${searchRes.count}条` : searchRes.status,
+                ms: Date.now() - startTime,
+                stem: q.stemText.slice(0, 36),
+                answer: `HTTP ${res.status}`,
+                thinking: '请求失败或超时'
+            });
+            return null;
+        }
 
         let parsed = null;
         try {
@@ -1943,10 +2164,11 @@
 
         if (!parsed) return null;
         parsed.usedWebSearch = Boolean(webClues);
+        parsed.webCount = searchRes.count;
         parsed.usedModel = useModel;
         parsed.isMath = isMath;
 
-        // 智能二审复核：auto 模式下若 V3 置信度低于阈值或未能匹配选项，自动升级 R1 深度复核！
+        // 智能分流模式下若 V3 置信度低于阈值或未能匹配选项，自动升级 R1 复核
         const conf = typeof parsed.confidence === 'number' ? parsed.confidence : 0.9;
         const matchedNow = q.options.length > 0 ? matchOptionsAccurately(q.options, parsed) : [1];
         if (!overrideModel && STATE.modelMode === 'auto' && useModel === 'deepseek-chat' && (conf < CONFIG.autoEscalateThreshold || matchedNow.length === 0)) {
@@ -1958,14 +2180,30 @@
                     const r1Parsed = safeParseAIJson(r1Msg.content || '{}', r1Msg.reasoning_content || '');
                     if (r1Parsed) {
                         r1Parsed.usedWebSearch = Boolean(webClues);
+                        r1Parsed.webCount = searchRes.count;
                         r1Parsed.usedModel = 'deepseek-reasoner';
                         r1Parsed.isMath = isMath;
                         r1Parsed.escalated = true;
-                        return r1Parsed;
+                        parsed = r1Parsed;
                     }
                 } catch (_) {}
             }
         }
+
+        if (stemKey) {
+            STATE.sessionCache.set(`${stemKey}::${parsed.usedModel}`, parsed);
+            STATE.sessionCache.set(sessionKey, parsed);
+        }
+
+        addLog({
+            scene,
+            model: parsed.usedModel === 'deepseek-reasoner' ? (parsed.escalated ? 'R1复核' : 'R1深度') : 'V3',
+            web: searchRes.count > 0 ? `命中${searchRes.count}条` : (searchRes.status === 'skipped-math' ? '数学跳过' : '未命中'),
+            ms: Date.now() - startTime,
+            stem: q.stemText.slice(0, 36),
+            answer: (parsed.answerLetters || []).join('') || (parsed.answerTexts || []).join('|'),
+            thinking: parsed.thinking || ''
+        });
 
         return parsed;
     }
@@ -2007,7 +2245,6 @@
             if (opt && !matched.includes(opt)) matched.push(opt);
         };
 
-        // 1. 单选且文本精确匹配（含数学符号归一化）
         if (texts.length === 1 && letters.length <= 1) {
             const normTarget = normalizeForOptionMatch(texts[0]);
             if (normTarget.length >= 1) {
@@ -2019,13 +2256,11 @@
             }
         }
 
-        // 2. 按选项字母精准匹配
         for (const letChar of letters) {
             const byLetter = qOptions.find(o => o.letter === letChar);
             if (byLetter) addUnique(byLetter);
         }
 
-        // 3. 若字母未命中，尝试判断题语义匹配（正确/对/√/T vs 错误/错/×/F）
         if (matched.length === 0 && texts.length > 0 && qOptions.length === 2) {
             const targetPol = detectTrueFalsePolarity(texts[0]);
             if (targetPol) {
@@ -2037,7 +2272,6 @@
             }
         }
 
-        // 4. 文本归一化包含兜底
         if (matched.length === 0 && texts.length > 0) {
             for (const t of texts) {
                 const normT = normalizeForOptionMatch(t);
@@ -2072,11 +2306,11 @@
         return allQuestions.map((q, i) => {
             const optsInline = q.options.map(o => `${o.letter}.${o.cleanContent}`).join(' ');
             return `T${i + 1}: ${q.stemText.slice(0, 95)} [${optsInline.slice(0, 95)}]`;
-        }).join('\n').slice(0, 3200);
+        }).join('\n').slice(0, 3400);
     }
 
     /********************************************************************
-     * 11. 高数增强 + 智能并发 全卷自动连刷流水线
+     * 11. 准确率优先 全卷自动连刷流水线
      ********************************************************************/
     async function startFullPageAutoSweep() {
         harvestGradedPageAnswers();
@@ -2102,10 +2336,9 @@
         const total = allQuestions.length;
         let completedCount = 0;
 
-        const hasMathInPaper = allQuestions.some(q => isMathQuestion(q.stemText, q.options));
-        const concurrency = (STATE.modelMode === 'deepseek-reasoner' || (STATE.modelMode === 'auto' && hasMathInPaper))
-            ? CONFIG.concurrencyReasoner
-            : CONFIG.concurrencyChat;
+        const concurrency = STATE.modelMode === 'deepseek-chat'
+            ? CONFIG.concurrencyChat
+            : CONFIG.concurrencyReasoner;
 
         const paperContextSummary = buildFullPaperCrossContext(allQuestions);
         const resultPromises = new Array(total);
@@ -2115,7 +2348,9 @@
             const maxIdx = Math.min(total, limitIdx);
             while (nextPrefetchIdx < maxIdx && !STATE.stopBatchRequested) {
                 const idx = nextPrefetchIdx++;
-                resultPromises[idx] = requestSingleQuestionCoTAnalysis(allQuestions[idx], paperContextSummary);
+                resultPromises[idx] = requestSingleQuestionCoTAnalysis(allQuestions[idx], paperContextSummary, {
+                    scene: `连刷#${idx + 1}`
+                });
             }
         }
 
@@ -2128,11 +2363,11 @@
             if (parsedMeta.isMath) badges.push('<span class="ds-badge ds-badge-math">📐 高数验算</span>');
             if (parsedMeta.usedModel === 'deepseek-reasoner') badges.push('<span class="ds-badge">🔬 R1深度</span>');
             else if (parsedMeta.usedModel === 'memory') badges.push('<span class="ds-badge">📚 题库命中</span>');
-            else if (parsedMeta.usedWebSearch) badges.push('<span class="ds-badge">🌐 联网RAG</span>');
+            if (parsedMeta.webCount > 0) badges.push(`<span class="ds-badge">🌐 搜到${parsedMeta.webCount}条</span>`);
 
             ui.contentBox.innerHTML = `
                 <div style="display:flex;justify-content:space-between;align-items:center;color:#34d399;font-weight:600;font-size:12.5px;">
-                    <span>⚡ 全卷高准连刷 (${curNum}/${total})</span>
+                    <span>🔬 全卷最高准连刷 (${curNum}/${total})</span>
                     <span style="font-size:11px;color:#94a3b8;">轻点 ⚡ 暂停</span>
                 </div>
                 <div class="ds-progress-bar-bg">
@@ -2143,7 +2378,7 @@
                         <span>第 ${curNum} 题：${escapeHtml(titlePreview.slice(0, 24))}...</span>
                         ${badges.join('')}
                     </div>
-                    <div class="ds-answer-main">${escapeHtml(answerPreview || '🔬 正在深度推导与验算...')}</div>
+                    <div class="ds-answer-main">${escapeHtml(answerPreview || '🔬 正在 R1 深度推导与验算...')}</div>
                     ${thinkingNote ? `<div class="ds-answer-sub">${escapeHtml(thinkingNote.slice(0, 120))}</div>` : ''}
                 </div>
             `;
@@ -2162,7 +2397,7 @@
             updateSweepProgressUI(
                 curNum,
                 q.stemText,
-                qIsMath ? '📐 高数题：R1 深度演算与反向验算中...' : '🌐 正在联网搜题与全卷互证...',
+                qIsMath ? '📐 高数题：R1 深度演算与反向验算中...' : '🔬 R1 深度推理 + 联网核对中...',
                 '',
                 { isMath: qIsMath }
             );
@@ -2188,7 +2423,6 @@
                 }
                 completedCount++;
             } else if (action.type === 'input') {
-                // 支持多空填空题逐一填入
                 for (let k = 0; k < q.inputs.length; k++) {
                     const val = action.ansTexts[k] ?? action.ansTexts[0];
                     if (val !== undefined) {
@@ -2216,14 +2450,14 @@
                 ui.contentBox.innerHTML = `
                     <div class="ds-answer-box" style="border-left-color:#f59e0b;">
                         <div class="ds-answer-main" style="color:#f59e0b;">⏸️ 全卷连刷已手动暂停</div>
-                        <div class="ds-answer-sub">已完成 ${completedCount} / ${total} 题。长按或连点 3 下 🎯 可继续。</div>
+                        <div class="ds-answer-sub">已完成 ${completedCount} / ${total} 题。点右上角 📋 可查看每题诊断日志。</div>
                     </div>
                 `;
             } else {
                 ui.contentBox.innerHTML = `
                     <div class="ds-answer-box">
                         <div class="ds-answer-main">🎉 全卷 ${completedCount} / ${total} 题已全部选完！</div>
-                        <div class="ds-answer-sub">已完成【📐 高数 R1 深度验算 + 🌐 联网互证】作答，请快速核对后提交。</div>
+                        <div class="ds-answer-sub">已完成【🔬 R1 深度验算 + 🌐 限速联网核对】作答，点右上角 📋 可查看每题详细日志。</div>
                     </div>
                 `;
             }
@@ -2231,43 +2465,60 @@
     }
 
     /********************************************************************
-     * 12. 单题解析功能（轻点 1 下悬浮球触发，支持一键点选与 R1 深度重算）
+     * 12. 单题解析功能（与连刷共用同一套题干提取对象，彻底消除不一致）
      ********************************************************************/
-    function findSingleQuestionScope() {
+    function findSingleQuestionObject(allQuestions) {
         const ui = getUIElements();
         const hitUnderMouse = document.elementFromPoint(STATE.lastMousePos.x, STATE.lastMousePos.y);
-        let curr = (STATE.lastPickedScope && STATE.lastPickedScope.ownerDocument?.body.contains(STATE.lastPickedScope))
+        let picked = (STATE.lastPickedScope && STATE.lastPickedScope.ownerDocument?.body.contains(STATE.lastPickedScope))
             ? STATE.lastPickedScope
             : (hitUnderMouse || document.activeElement);
 
-        if (curr && (curr === ui.fab || ui.fab?.contains(curr) || curr === ui.card || ui.card?.contains(curr))) {
-            curr = null;
+        if (picked && (picked === ui.fab || ui.fab?.contains(picked) || picked === ui.card || ui.card?.contains(picked))) {
+            picked = null;
         }
 
-        if (!curr || curr === document.body) {
-            const allQ = collectAllQuestionsOnPage();
-            const inView = allQ.find(q => {
+        // 优先从 collectAllQuestionsOnPage() 中直接匹配，确保单题与连刷的 blockEl/stemText/options 100% 相同！
+        if (allQuestions && allQuestions.length > 0) {
+            if (picked) {
+                const containing = allQuestions.find(q => q.blockEl === picked || q.blockEl.contains(picked));
+                if (containing) return containing;
+            }
+            const inView = allQuestions.find(q => {
                 const r = q.blockEl.getBoundingClientRect();
                 return r.bottom > 60 && r.top < window.innerHeight - 60;
-            }) || allQ[0];
-            if (inView) return inView.blockEl;
-            return document.body;
+            }) || allQuestions[0];
+            if (inView) return inView;
         }
 
+        // 兜底：当页面未命中标准题目块时向上回溯
+        let curr = picked;
         let depth = 0;
         while (curr && curr !== document.body && depth < 12) {
-            const isMatched = STRICT_QUESTION_BLOCK_SELECTORS.some(sel => {
-                try { return curr.matches && curr.matches(sel); } catch (_) { return false; }
-            });
             const opts = extractOptionsFromBlock(curr);
             const inps = extractInputsFromBlock(curr);
-            if (isMatched || (opts.length >= 2 && opts.length <= 8) || (inps.length >= 1 && extractRichMathText(curr).length >= 5)) {
-                return curr;
+            if ((opts.length >= 2 && opts.length <= 8) || (inps.length >= 1 && extractRichMathText(curr).length >= 5)) {
+                return {
+                    index: 0,
+                    blockEl: curr,
+                    options: opts,
+                    inputs: inps,
+                    stemText: extractPureQuestionStem(curr, opts, inps[0] || null).slice(0, 1400)
+                };
             }
             curr = curr.parentElement;
             depth++;
         }
-        return document.body;
+
+        const fallbackOpts = extractOptionsFromBlock(document.body);
+        const fallbackInps = extractInputsFromBlock(document.body);
+        return {
+            index: 0,
+            blockEl: document.body,
+            options: fallbackOpts,
+            inputs: fallbackInps,
+            stemText: extractPureQuestionStem(document.body, fallbackOpts, fallbackInps[0] || null).slice(0, 1400)
+        };
     }
 
     function renderSingleResult(qObj, parsed, paperContextSummary) {
@@ -2275,7 +2526,7 @@
         if (!ui.contentBox) return;
 
         if (!parsed) {
-            ui.contentBox.innerHTML = `<div style="color:#ef4444;">❌ 解析失败，请检查 API Key 余额或网络连接（点右上角 ⚙️ 可修改 Key）。</div>`;
+            ui.contentBox.innerHTML = `<div style="color:#ef4444;">❌ 解析失败，请检查 API Key 余额或网络（点右上角 ⚙️ 可修改 Key，📋 可看日志）。</div>`;
             return;
         }
 
@@ -2293,7 +2544,10 @@
         } else if (parsed.usedModel === 'memory') {
             badges.push('<span class="ds-badge">📚 已验证题库</span>');
         } else {
-            badges.push(`<span class="ds-badge">${parsed.usedWebSearch ? '🌐 联网+V3' : '⚡ V3推理'}</span>`);
+            badges.push(`<span class="ds-badge">⚡ V3推理</span>`);
+        }
+        if (parsed.webCount > 0) {
+            badges.push(`<span class="ds-badge">🌐 搜到${parsed.webCount}条</span>`);
         }
 
         ui.contentBox.innerHTML = `
@@ -2304,7 +2558,7 @@
             </div>
             <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:2px;">
                 ${action.type !== 'none' ? `<button class="ds-btn ds-btn-fill" id="ds-single-apply-btn">✅ 一键点选/填入本题</button>` : ''}
-                ${parsed.usedModel !== 'deepseek-reasoner' ? `<button class="ds-btn ds-btn-accent" id="ds-single-r1-btn">🔬 用 R1 深度重算</button>` : ''}
+                <button class="ds-btn ds-btn-accent" id="ds-single-r1-btn">🔄 R1重新深度演算</button>
             </div>
         `;
 
@@ -2340,10 +2594,14 @@
                 ui.contentBox.innerHTML = `
                     <div style="display:flex;align-items:center;gap:8px;color:#d8b4fe;">
                         <span>🔬</span>
-                        <span>正在调用 DeepSeek-R1 进行深度演算与复核...</span>
+                        <span>正在忽略缓存，调用 DeepSeek-R1 重新深度演算...</span>
                     </div>
                 `;
-                requestSingleQuestionCoTAnalysis(qObj, paperContextSummary, 'deepseek-reasoner').then((r1Parsed) => {
+                requestSingleQuestionCoTAnalysis(qObj, paperContextSummary, {
+                    overrideModel: 'deepseek-reasoner',
+                    forceFresh: true,
+                    scene: 'R1重算'
+                }).then((r1Parsed) => {
                     STATE.isAnalyzing = false;
                     if (ui.fab) ui.fab.classList.remove('ds-loading');
                     renderSingleResult(qObj, r1Parsed, paperContextSummary);
@@ -2362,35 +2620,32 @@
         if (!ensureApiKeyReady()) return;
         if (STATE.isAnalyzing || STATE.isBatchRunning) return;
 
-        const scopeEl = findSingleQuestionScope();
-        if (scopeEl && scopeEl !== document.body) {
-            scopeEl.classList.add('ds-scope-flash');
-            setTimeout(() => scopeEl.classList.remove('ds-scope-flash'), 700);
+        const allQuestions = collectAllQuestionsOnPage();
+        const qObj = findSingleQuestionObject(allQuestions);
+        const paperContextSummary = buildFullPaperCrossContext(allQuestions);
+
+        if (qObj.blockEl && qObj.blockEl !== document.body) {
+            qObj.blockEl.classList.add('ds-scope-flash');
+            setTimeout(() => qObj.blockEl.classList.remove('ds-scope-flash'), 700);
         }
 
-        const options = extractOptionsFromBlock(scopeEl);
-        const inputs = extractInputsFromBlock(scopeEl);
-        const stemText = extractPureQuestionStem(scopeEl, options, inputs[0] || null).slice(0, 1400);
-        const allQuestions = collectAllQuestionsOnPage();
-        const paperContextSummary = buildFullPaperCrossContext(allQuestions);
-        const qIsMath = isMathQuestion(stemText, options);
-        const qObj = { blockEl: scopeEl, stemText, options, inputs };
+        const qIsMath = isMathQuestion(qObj.stemText, qObj.options);
         STATE.lastSingleContext = { qObj, paperContextSummary };
 
         showCard();
         if (ui.contentBox) {
             ui.contentBox.innerHTML = `
                 <div style="display:flex;align-items:center;gap:8px;color:${qIsMath ? '#d8b4fe' : '#38bdf8'};">
-                    <span>${qIsMath ? '📐' : '🌐'}</span>
-                    <span>${qIsMath ? '识别为高数/计算题，正在 R1 深度演算与反向验算...' : '正在实时联网搜题并结合全卷互证解析...'}</span>
+                    <span>${qIsMath ? '📐' : '🔬'}</span>
+                    <span>${qIsMath ? '识别为高数/计算题，正在 R1 深度演算与反向验算...' : '正在 R1 深度推理 + 联网核对与全卷互证...'}</span>
                 </div>
-                <div style="font-size:11.5px;color:#94a3b8;margin-top:4px;">题目：${escapeHtml(stemText.slice(0, 48))}...</div>
+                <div style="font-size:11.5px;color:#94a3b8;margin-top:4px;">题目：${escapeHtml(qObj.stemText.slice(0, 48))}...</div>
             `;
         }
         if (ui.fab) ui.fab.classList.add('ds-loading');
         STATE.isAnalyzing = true;
 
-        requestSingleQuestionCoTAnalysis(qObj, paperContextSummary).then((parsed) => {
+        requestSingleQuestionCoTAnalysis(qObj, paperContextSummary, { scene: '单题' }).then((parsed) => {
             STATE.isAnalyzing = false;
             if (ui.fab) ui.fab.classList.remove('ds-loading');
             renderSingleResult(qObj, parsed, paperContextSummary);
