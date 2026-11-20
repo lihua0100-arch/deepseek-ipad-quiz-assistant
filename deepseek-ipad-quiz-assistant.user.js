@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name    DeepSeek 智能题库助手 (iPad 学习通/U校园/全平台触屏通用版)
 // @namespace    https://tampermonkey.net/
-// @version      3.7.0
+// @version      3.8.0
 // @updateURL    https://raw.githubusercontent.com/lihua0100-arch/deepseek-ipad-quiz-assistant/main/deepseek-ipad-quiz-assistant.user.js
 // @downloadURL  https://raw.githubusercontent.com/lihua0100-arch/deepseek-ipad-quiz-assistant/main/deepseek-ipad-quiz-assistant.user.js
-// @description  全题型准确率优先旗舰版（适配手机 / iPad Safari Stay / Tampermonkey，支持学习通、U校园、超星尔雅、雨课堂、智慧树）：1.全面支持选择题（单/多/判断）、填空题（多空顺序自动填入+富文本自动保存）、大题（简答/计算/证明/论述完整分步解答+一键复制/填入，含无输入框拍照题）；2.默认全题 DeepSeek-R1 深度推理+高数反向验算；3.无损提取 KaTeX/MathJax/MathML/上下标/公式图片，限速联网搜题+会话缓存彻底消除单题与连刷不一致！
+// @description  全题型准确率优先旗舰版（适配手机 / iPad Safari Stay / Tampermonkey，支持学习通考试页、U校园、超星尔雅、雨课堂、智慧树）：1.新增跨域 iframe 双向穿透桥接+自动过滤隐藏弹窗与防作弊水印（彻底解决手机考试页抓到“交卷成功/人脸比对/乱码水印”问题）；2.全面支持选择题、填空题、大题（完整分步解答+一键复制/填入）；3.默认全题 DeepSeek-R1 深度推理+高数无损公式提取+限速联网搜题+内置诊断日志！
 // @author       Gemini
 // @match        *://*/*
 // @allFrames    true
@@ -82,8 +82,13 @@
 
     function addLog(entry) {
         const now = new Date();
-        const ts = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}:${String(now.getSeconds()).padStart(2, '0')}`;
-        STATE.logs.unshift(Object.assign({ ts }, entry));
+        const ts = entry.ts || `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}:${String(now.getSeconds()).padStart(2, '0')}`;
+        const fullEntry = Object.assign({ ts }, entry);
+        if (!isTopFrame) {
+            try { window.top.postMessage({ __dsQuiz: true, type: 'LOG', entry: fullEntry }, '*'); } catch (_) {}
+            return;
+        }
+        STATE.logs.unshift(fullEntry);
         if (STATE.logs.length > 120) STATE.logs.length = 120;
         const ui = getUIElements();
         if (ui.logPanel && ui.logPanel.classList.contains('ds-show')) {
@@ -97,10 +102,11 @@
         return '⚡ V3极速';
     }
 
-    // 统一清理平台干扰词（如学习通题干右侧的“AI讲解”按钮文字）
+    // 统一清理平台干扰词（如学习通“AI讲解”按钮、防作弊重复十六进制水印 b60ff24fb60ff24f...）
     function stripPlatformNoiseText(text) {
         return String(text || '')
             .replace(/\bAI\s*讲解/gi, ' ')
+            .replace(/([0-9a-f]{6,16})\1{2,}[0-9a-f]*/gi, ' ')
             .replace(/(?:查看解析|收藏本题|纠错|记笔记)\s*$/g, '')
             .replace(/[ \t\r\n]+/g, ' ')
             .trim();
@@ -283,11 +289,47 @@
     }
 
     /**
-     * 无损提取含高等数学公式的节点文本，并自动剔除“AI讲解”等平台按钮噪声
+     * 无损提取含高等数学公式的节点文本，自动过滤隐藏弹窗(display:none)、防作弊水印与“AI讲解”按钮噪声
      */
     function extractRichMathText(node) {
         if (!node) return '';
+
+        // 0. 在克隆前标记真实 DOM 中不可见元素（如隐藏的“交卷成功/人脸比对中”弹窗）与水印层
+        //    注意跳过 KaTeX/MathJax/MathML 数学公式注解节点，避免误删 LaTeX 源码
+        const markedHidden = [];
+        try {
+            if (node.querySelectorAll && node.ownerDocument && node.ownerDocument.defaultView) {
+                const win = node.ownerDocument.defaultView;
+                const allEls = node.querySelectorAll('*');
+                for (let i = 0; i < allEls.length; i++) {
+                    const el = allEls[i];
+                    const tag = (el.tagName || '').toLowerCase();
+                    if (tag === 'script' || tag === 'annotation' || tag === 'math' || tag === 'mjx-container') continue;
+                    const cls = typeof el.className === 'string' ? el.className : '';
+                    if (/katex|mathjax|mjx/i.test(cls)) continue;
+                    if (/watermark|mask-box|maskLayer|modal|dialog|toast|popup|faceCheck|face-check/i.test(cls) || /watermark/i.test(el.id || '')) {
+                        el.setAttribute('data-ds-hidden', '1');
+                        markedHidden.push(el);
+                        continue;
+                    }
+                    if (el.hidden) {
+                        el.setAttribute('data-ds-hidden', '1');
+                        markedHidden.push(el);
+                        continue;
+                    }
+                    const cs = win.getComputedStyle(el);
+                    if (cs && (cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0')) {
+                        el.setAttribute('data-ds-hidden', '1');
+                        markedHidden.push(el);
+                    }
+                }
+            }
+        } catch (_) {}
+
         const clone = node.cloneNode(true);
+        for (let i = 0; i < markedHidden.length; i++) {
+            try { markedHidden[i].removeAttribute('data-ds-hidden'); } catch (_) {}
+        }
         const doc = clone.ownerDocument || document;
 
         const replaceWithText = (el, text) => {
@@ -295,8 +337,8 @@
             el.replaceWith(doc.createTextNode(text));
         };
 
-        // 1. 移除干扰与不可见元素（含平台 AI讲解 按钮，保留 script[type^="math/tex"]）
-        clone.querySelectorAll('style, noscript, .ans-icon, .font-cxsecret-ignore, .marking_duigou, .marking_cuowu, [class*="ai-explain"], [class*="aiExplain"], [class*="ai_explain"]').forEach(el => el.remove());
+        // 1. 移除干扰与不可见元素（含隐藏弹窗、水印层、平台 AI讲解 按钮，保留 script[type^="math/tex"]）
+        clone.querySelectorAll('[data-ds-hidden="1"], style, noscript, .ans-icon, .font-cxsecret-ignore, .marking_duigou, .marking_cuowu, [class*="ai-explain"], [class*="aiExplain"], [class*="ai_explain"], [class*="watermark"], [id*="watermark"]').forEach(el => el.remove());
         clone.querySelectorAll('button, a, span, div').forEach(el => {
             if (el.children.length <= 2 && /^\s*(AI\s*讲解|查看解析|收藏|纠错)\s*$/i.test(el.textContent || '')) {
                 el.remove();
@@ -1160,7 +1202,7 @@
         cardEl.id = 'ds-card';
         cardEl.innerHTML = `
             <div class="ds-card-header">
-                <span class="ds-card-title">🔬 DeepSeek 题库助手 3.7 (全题型高准)</span>
+                <span class="ds-card-title">🔬 DeepSeek 题库助手 3.8 (全题型+跨帧修复)</span>
                 <span class="ds-header-icons">
                     <button class="ds-icon-btn" id="ds-card-log-btn" title="查看/复制诊断日志">📋</button>
                     <button class="ds-icon-btn" id="ds-card-settings-btn" title="设置 API Key 与题库">⚙️</button>
@@ -1280,6 +1322,7 @@
         document.getElementById('ds-btn-autosweep').addEventListener('click', () => {
             if (STATE.isBatchRunning) {
                 STATE.stopBatchRequested = true;
+                postToAllChildFrames({ __dsQuiz: true, type: 'CMD', cmd: 'stop' });
             } else {
                 startFullPageAutoSweep();
             }
@@ -1671,10 +1714,14 @@
      * 8. 精准题目与选项提取器（单题与连刷完全统一）
      ********************************************************************/
     const STRICT_QUESTION_BLOCK_SELECTORS = [
-        '.TiMu', '.singleQuesId', '.questionLi',
+        '.TiMu', '.singleQuesId', '.questionLi', '.mark_item', '.padBom50',
+        '.stem_answer', '.single_item', '.ques_item', '.test_question',
+        '.exam-question', '.ans-question', '.whiteDiv', '.sub_item', '.topic_item',
+        '[id^="sigleQuestionDiv"]', '[id^="question"]',
         '.question-common-abs-reply', '.question-inputbox',
         '.question-item', '.question-box', '.question-card', '.exam-item',
         '.subject-item', '.q-item', '.ti-item', '.problem-item',
+        '[class*="questionItem"]', '[class*="question_item"]',
         '[class*="question-wrapper"]', '[class*="question-container"]', '[class*="exercise-item"]'
     ];
 
@@ -1705,9 +1752,9 @@
     function extractOptionsFromBlock(blockEl) {
         const priorityGroups = [
             '.answerBg',
-            '.single_choice li, .multi_choice li, .true_false li, .answerList li',
-            '.ant-radio-wrapper, .ant-checkbox-wrapper, .el-radio, .el-checkbox',
-            '[class*="option-item"], [class*="optionItem"], [class*="choice-item"], .option, .question-option',
+            '.stem_answer .answer_p, .single_choice li, .multi_choice li, .true_false li, .answerList li',
+            '.ant-radio-wrapper, .ant-checkbox-wrapper, .el-radio, .el-checkbox, .van-radio, .van-checkbox, .weui-check__label',
+            '[class*="answerBg"], [class*="option-item"], [class*="optionItem"], [class*="option_item"], [class*="choice-item"], [class*="choice_item"], .option, .question-option',
             'li[role="option"], div[role="radio"], div[role="checkbox"]'
         ];
 
@@ -2385,28 +2432,152 @@
     }
 
     /********************************************************************
-     * 11. 准确率优先 全卷自动连刷流水线
+     * 11. 跨域 iframe 穿透桥接 + 准确率优先 全卷自动连刷流水线
      ********************************************************************/
-    async function startFullPageAutoSweep() {
+    let activeChildFrameSource = null;
+    let pendingClaimResolve = null;
+
+    function postToAllChildFrames(msg) {
+        const frames = document.querySelectorAll('iframe');
+        let sentCount = 0;
+        for (const ifr of frames) {
+            try {
+                if (ifr.contentWindow) {
+                    ifr.contentWindow.postMessage(msg, '*');
+                    sentCount++;
+                }
+            } catch (_) {}
+        }
+        return sentCount;
+    }
+
+    function dispatchCommandToChildFrames(cmd) {
+        const framesCount = postToAllChildFrames({
+            __dsQuiz: true,
+            type: 'CMD',
+            cmd,
+            apiKey: STATE.apiKey,
+            modelMode: STATE.modelMode,
+            webSearchEnabled: STATE.webSearchEnabled
+        });
+        if (framesCount === 0) return Promise.resolve(false);
+        return new Promise((resolve) => {
+            pendingClaimResolve = resolve;
+            setTimeout(() => {
+                if (pendingClaimResolve === resolve) {
+                    pendingClaimResolve = null;
+                    resolve(false);
+                }
+            }, 650);
+        });
+    }
+
+    function reportCardHtml(html) {
+        if (isTopFrame) {
+            const ui = getUIElements();
+            showCard();
+            if (ui.contentBox) ui.contentBox.innerHTML = html;
+        } else {
+            try { window.top.postMessage({ __dsQuiz: true, type: 'UI_HTML', html }, '*'); } catch (_) {}
+        }
+    }
+
+    function reportFabState(state) {
+        if (isTopFrame) {
+            const ui = getUIElements();
+            if (!ui.fab) return;
+            if (state === 'loading') {
+                ui.fab.classList.remove('ds-turbo-spin');
+                ui.fab.classList.add('ds-loading');
+            } else if (state === 'turbo') {
+                startTurboSpinEffect();
+            } else {
+                stopTurboSpinEffect();
+            }
+        } else {
+            try { window.top.postMessage({ __dsQuiz: true, type: 'FAB_STATE', state }, '*'); } catch (_) {}
+        }
+    }
+
+    window.addEventListener('message', (e) => {
+        const msg = e.data;
+        if (!msg || !msg.__dsQuiz) return;
+
+        if (isTopFrame) {
+            if (msg.type === 'CLAIMED') {
+                activeChildFrameSource = e.source;
+                if (pendingClaimResolve) {
+                    const fn = pendingClaimResolve;
+                    pendingClaimResolve = null;
+                    fn(true);
+                }
+            } else if (msg.type === 'UI_HTML') {
+                reportCardHtml(msg.html);
+            } else if (msg.type === 'FAB_STATE') {
+                reportFabState(msg.state);
+            } else if (msg.type === 'LOG' && msg.entry) {
+                addLog(msg.entry);
+            } else if (msg.type === 'SINGLE_RESULT' && msg.payload) {
+                activeChildFrameSource = e.source;
+                renderRemoteSingleResultInTop(msg.payload);
+            }
+            return;
+        }
+
+        // 子 iframe 接收顶层指令
+        if (msg.type === 'CMD') {
+            if (msg.apiKey) STATE.apiKey = msg.apiKey;
+            if (msg.modelMode) STATE.modelMode = msg.modelMode;
+            if (typeof msg.webSearchEnabled === 'boolean') STATE.webSearchEnabled = msg.webSearchEnabled;
+
+            if (msg.cmd === 'stop') {
+                STATE.stopBatchRequested = true;
+                postToAllChildFrames(msg);
+                return;
+            }
+            if (msg.cmd === 'apply-last' && STATE.lastSingleAction) {
+                applySavedSingleActionInFrame();
+                return;
+            }
+            if (msg.cmd === 'r1-last' && STATE.lastSingleContext) {
+                rerunLastSingleInFrame();
+                return;
+            }
+            if (msg.cmd === 'single' || msg.cmd === 'sweep') {
+                const localQs = collectAllQuestionsOnPage();
+                if (localQs.length > 0) {
+                    try { window.top.postMessage({ __dsQuiz: true, type: 'CLAIMED' }, '*'); } catch (_) {}
+                    if (msg.cmd === 'single') triggerSingleQuestionAnalysis(true);
+                    else startFullPageAutoSweep(true);
+                } else {
+                    // 若当前 iframe 内部还有嵌套 iframe，继续向下透传
+                    postToAllChildFrames(msg);
+                }
+            }
+        }
+    });
+
+    async function startFullPageAutoSweep(fromRemoteCmd = false) {
         harvestGradedPageAnswers();
 
         const ui = getUIElements();
-        if (!ensureApiKeyReady()) return;
+        if (!fromRemoteCmd && !ensureApiKeyReady()) return;
         if (STATE.isBatchRunning) return;
 
         const allQuestions = collectAllQuestionsOnPage();
         if (allQuestions.length === 0) {
-            showCard();
-            if (ui.contentBox) {
-                ui.contentBox.innerHTML = `<div style="color:#f59e0b;">⚠️ 未在当前页面扫描到题目列表，请确认题目已加载完毕。</div>`;
+            if (isTopFrame && !fromRemoteCmd) {
+                const claimed = await dispatchCommandToChildFrames('sweep');
+                if (claimed) return;
             }
+            reportCardHtml(`<div style="color:#f59e0b;">⚠️ 未在当前页面或子框架中扫描到题目列表，请确认题目已加载完毕。</div>`);
             return;
         }
 
         STATE.isBatchRunning = true;
         STATE.stopBatchRequested = false;
-        startTurboSpinEffect();
-        showCard();
+        reportFabState('turbo');
+        if (isTopFrame) showCard();
 
         const total = allQuestions.length;
         let completedCount = 0;
@@ -2432,7 +2603,6 @@
         triggerPrefetchUpTo(concurrency);
 
         const updateSweepProgressUI = (curNum, titlePreview, answerPreview, thinkingNote, parsedMeta = {}) => {
-            if (!ui.contentBox) return;
             const pct = Math.round((curNum / total) * 100);
             const badges = [];
             if (parsedMeta.isMath) badges.push('<span class="ds-badge ds-badge-math">📐 高数验算</span>');
@@ -2440,7 +2610,7 @@
             else if (parsedMeta.usedModel === 'memory') badges.push('<span class="ds-badge">📚 题库命中</span>');
             if (parsedMeta.webCount > 0) badges.push(`<span class="ds-badge">🌐 搜到${parsedMeta.webCount}条</span>`);
 
-            ui.contentBox.innerHTML = `
+            reportCardHtml(`
                 <div style="display:flex;justify-content:space-between;align-items:center;color:#34d399;font-weight:600;font-size:12.5px;">
                     <span>🔬 全卷最高准连刷 (${curNum}/${total})</span>
                     <span style="font-size:11px;color:#94a3b8;">轻点 ⚡ 暂停</span>
@@ -2456,7 +2626,7 @@
                     <div class="ds-answer-main">${escapeHtml(answerPreview || '🔬 正在 R1 深度推导与验算...')}</div>
                     ${thinkingNote ? `<div class="ds-answer-sub">${escapeHtml(thinkingNote.slice(0, 120))}</div>` : ''}
                 </div>
-            `;
+            `);
         };
 
         for (let i = 0; i < total; i++) {
@@ -2532,24 +2702,22 @@
         }
 
         STATE.isBatchRunning = false;
-        stopTurboSpinEffect();
+        reportFabState('idle');
 
-        if (ui.contentBox) {
-            if (STATE.stopBatchRequested) {
-                ui.contentBox.innerHTML = `
-                    <div class="ds-answer-box" style="border-left-color:#f59e0b;">
-                        <div class="ds-answer-main" style="color:#f59e0b;">⏸️ 全卷连刷已手动暂停</div>
-                        <div class="ds-answer-sub">已完成 ${completedCount} / ${total} 题。点右上角 📋 可查看每题诊断日志。</div>
-                    </div>
-                `;
-            } else {
-                ui.contentBox.innerHTML = `
-                    <div class="ds-answer-box">
-                        <div class="ds-answer-main">🎉 全卷 ${completedCount} / ${total} 题已全部选完！</div>
-                        <div class="ds-answer-sub">已完成【🔬 R1 深度验算 + 🌐 限速联网核对】作答，点右上角 📋 可查看每题详细日志。</div>
-                    </div>
-                `;
-            }
+        if (STATE.stopBatchRequested) {
+            reportCardHtml(`
+                <div class="ds-answer-box" style="border-left-color:#f59e0b;">
+                    <div class="ds-answer-main" style="color:#f59e0b;">⏸️ 全卷连刷已手动暂停</div>
+                    <div class="ds-answer-sub">已完成 ${completedCount} / ${total} 题。点右上角 📋 可查看每题诊断日志。</div>
+                </div>
+            `);
+        } else {
+            reportCardHtml(`
+                <div class="ds-answer-box">
+                    <div class="ds-answer-main">🎉 全卷 ${completedCount} / ${total} 题已全部选完！</div>
+                    <div class="ds-answer-sub">已完成【🔬 R1 深度验算 + 🌐 限速联网核对】作答，点右上角 📋 可查看每题详细日志。</div>
+                </div>
+            `);
         }
     }
 
@@ -2610,18 +2778,113 @@
         };
     }
 
-    function renderSingleResult(qObj, parsed, paperContextSummary) {
+    function renderRemoteSingleResultInTop(payload) {
         const ui = getUIElements();
+        showCard();
         if (!ui.contentBox) return;
+        ui.contentBox.innerHTML = `
+            <div class="ds-answer-box">
+                <div class="ds-answer-meta">${payload.badgesHtml || ''}</div>
+                <div class="ds-answer-main${payload.isEssay ? ' ds-answer-essay' : ''}">${escapeHtml(payload.ansDisplay || '')}</div>
+                ${payload.thinking ? `<div class="ds-answer-sub">${escapeHtml(payload.thinking)}</div>` : ''}
+            </div>
+            <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:2px;">
+                ${payload.canApply ? `<button class="ds-btn ds-btn-fill" id="ds-single-apply-btn">✅ 一键点选/填入本题</button>` : ''}
+                ${payload.copyableText ? `<button class="ds-btn" id="ds-single-copy-btn">📋 复制答案</button>` : ''}
+                <button class="ds-btn ds-btn-accent" id="ds-single-r1-btn">🔄 R1重算</button>
+            </div>
+        `;
+        const applyBtn = ui.contentBox.querySelector('#ds-single-apply-btn');
+        if (applyBtn) {
+            applyBtn.addEventListener('click', () => {
+                if (activeChildFrameSource) {
+                    try { activeChildFrameSource.postMessage({ __dsQuiz: true, type: 'CMD', cmd: 'apply-last' }, '*'); } catch (_) {}
+                }
+                applyBtn.innerText = '✅ 已触发填入';
+            });
+        }
+        const copyBtn = ui.contentBox.querySelector('#ds-single-copy-btn');
+        if (copyBtn) {
+            copyBtn.addEventListener('click', async () => {
+                try {
+                    await navigator.clipboard.writeText(payload.copyableText);
+                    copyBtn.innerText = '✅ 已复制';
+                    setTimeout(() => { copyBtn.innerText = '📋 复制答案'; }, 1200);
+                } catch (_) {
+                    prompt('复制以下解答内容：', payload.copyableText);
+                }
+            });
+        }
+        const r1Btn = ui.contentBox.querySelector('#ds-single-r1-btn');
+        if (r1Btn) {
+            r1Btn.addEventListener('click', () => {
+                if (activeChildFrameSource) {
+                    try { activeChildFrameSource.postMessage({ __dsQuiz: true, type: 'CMD', cmd: 'r1-last' }, '*'); } catch (_) {}
+                }
+            });
+        }
+    }
 
+    async function applySavedSingleActionInFrame() {
+        const saved = STATE.lastSingleAction;
+        if (!saved) return;
+        const { qObj, action, isEssay } = saved;
+        if (action.type === 'choice') {
+            for (const opt of action.matchedOpts) {
+                clickOptionElementReliably(opt.el);
+                if (action.matchedOpts.length > 1) await sleep(120);
+            }
+        } else if (action.type === 'input') {
+            if (isEssay) {
+                const inp = qObj.inputs[0];
+                inp.focus();
+                setNativeInputValue(inp, action.ansTexts.join('\n'), true);
+                inp.classList.add('ds-correct-highlight');
+            } else {
+                for (let k = 0; k < qObj.inputs.length; k++) {
+                    const val = action.ansTexts[k] ?? action.ansTexts[0];
+                    if (val !== undefined) {
+                        qObj.inputs[k].focus();
+                        setNativeInputValue(qObj.inputs[k], String(val).trim(), false);
+                        qObj.inputs[k].classList.add('ds-correct-highlight');
+                    }
+                }
+            }
+        }
+    }
+
+    function rerunLastSingleInFrame() {
+        if (STATE.isAnalyzing || !STATE.lastSingleContext) return;
+        const { qObj, paperContextSummary } = STATE.lastSingleContext;
+        STATE.isAnalyzing = true;
+        reportFabState('loading');
+        reportCardHtml(`
+            <div style="display:flex;align-items:center;gap:8px;color:#d8b4fe;">
+                <span>🔬</span>
+                <span>正在忽略缓存，调用 DeepSeek-R1 重新深度演算...</span>
+            </div>
+        `);
+        requestSingleQuestionCoTAnalysis(qObj, paperContextSummary, {
+            overrideModel: 'deepseek-reasoner',
+            forceFresh: true,
+            scene: 'R1重算'
+        }).then((r1Parsed) => {
+            STATE.isAnalyzing = false;
+            reportFabState('idle');
+            renderSingleResult(qObj, r1Parsed, paperContextSummary);
+        });
+    }
+
+    function renderSingleResult(qObj, parsed, paperContextSummary) {
         if (!parsed) {
-            ui.contentBox.innerHTML = `<div style="color:#ef4444;">❌ 解析失败，请检查 API Key 余额或网络（点右上角 ⚙️ 可修改 Key，📋 可看日志）。</div>`;
+            reportCardHtml(`<div style="color:#ef4444;">❌ 解析失败，请检查 API Key 余额或网络（点右上角 ⚙️ 可修改 Key，📋 可看日志）。</div>`);
             return;
         }
 
         const action = applyAnswerToQuestion(qObj, parsed);
         action.matchedOpts.forEach(opt => opt.el.classList.add('ds-correct-highlight'));
         const isEssay = action.kind === 'essay';
+        STATE.lastSingleAction = { qObj, action, isEssay };
 
         const ansDisplay = action.type === 'choice'
             ? action.matchedOpts.map(o => `${o.letter}. ${o.cleanContent}`).join(' | ')
@@ -2645,6 +2908,27 @@
         const canApply = action.type === 'choice' || action.type === 'input';
         const copyableText = action.ansTexts.length > 0 ? action.ansTexts.join('\n') : ansDisplay;
 
+        if (!isTopFrame) {
+            try {
+                window.top.postMessage({
+                    __dsQuiz: true,
+                    type: 'SINGLE_RESULT',
+                    payload: {
+                        ansDisplay,
+                        thinking: parsed.thinking || '',
+                        badgesHtml: badges.join(''),
+                        isEssay,
+                        canApply,
+                        copyableText
+                    }
+                }, '*');
+            } catch (_) {}
+            return;
+        }
+
+        const ui = getUIElements();
+        if (!ui.contentBox) return;
+
         ui.contentBox.innerHTML = `
             <div class="ds-answer-box">
                 <div class="ds-answer-meta">${badges.join('')}</div>
@@ -2661,30 +2945,8 @@
         const applyBtn = ui.contentBox.querySelector('#ds-single-apply-btn');
         if (applyBtn) {
             applyBtn.addEventListener('click', async () => {
-                if (action.type === 'choice') {
-                    for (const opt of action.matchedOpts) {
-                        clickOptionElementReliably(opt.el);
-                        if (action.matchedOpts.length > 1) await sleep(120);
-                    }
-                    applyBtn.innerText = '✅ 已自动点选';
-                } else if (action.type === 'input') {
-                    if (isEssay) {
-                        const inp = qObj.inputs[0];
-                        inp.focus();
-                        setNativeInputValue(inp, action.ansTexts.join('\n'), true);
-                        inp.classList.add('ds-correct-highlight');
-                    } else {
-                        for (let k = 0; k < qObj.inputs.length; k++) {
-                            const val = action.ansTexts[k] ?? action.ansTexts[0];
-                            if (val !== undefined) {
-                                qObj.inputs[k].focus();
-                                setNativeInputValue(qObj.inputs[k], String(val).trim(), false);
-                                qObj.inputs[k].classList.add('ds-correct-highlight');
-                            }
-                        }
-                    }
-                    applyBtn.innerText = '✅ 已自动填入';
-                }
+                await applySavedSingleActionInFrame();
+                applyBtn.innerText = action.type === 'choice' ? '✅ 已自动点选' : '✅ 已自动填入';
             });
         }
 
@@ -2703,41 +2965,46 @@
 
         const r1Btn = ui.contentBox.querySelector('#ds-single-r1-btn');
         if (r1Btn) {
-            r1Btn.addEventListener('click', () => {
-                if (STATE.isAnalyzing) return;
-                STATE.isAnalyzing = true;
-                if (ui.fab) ui.fab.classList.add('ds-loading');
-                ui.contentBox.innerHTML = `
-                    <div style="display:flex;align-items:center;gap:8px;color:#d8b4fe;">
-                        <span>🔬</span>
-                        <span>正在忽略缓存，调用 DeepSeek-R1 重新深度演算...</span>
-                    </div>
-                `;
-                requestSingleQuestionCoTAnalysis(qObj, paperContextSummary, {
-                    overrideModel: 'deepseek-reasoner',
-                    forceFresh: true,
-                    scene: 'R1重算'
-                }).then((r1Parsed) => {
-                    STATE.isAnalyzing = false;
-                    if (ui.fab) ui.fab.classList.remove('ds-loading');
-                    renderSingleResult(qObj, r1Parsed, paperContextSummary);
-                });
-            });
+            r1Btn.addEventListener('click', rerunLastSingleInFrame);
         }
     }
 
-    function triggerSingleQuestionAnalysis() {
+    async function triggerSingleQuestionAnalysis(fromRemoteCmd = false) {
         const harvested = harvestGradedPageAnswers();
         if (harvested.learnedRight > 0 || harvested.learnedWrong > 0) {
             return;
         }
 
-        const ui = getUIElements();
-        if (!ensureApiKeyReady()) return;
+        if (!fromRemoteCmd && !ensureApiKeyReady()) return;
         if (STATE.isAnalyzing || STATE.isBatchRunning) return;
 
         const allQuestions = collectAllQuestionsOnPage();
+
+        // 若顶层外壳页未扫到题目，先透传指令给跨域子 iframe（彻底解决手机学习通考试页抓到外壳乱码水印的问题！）
+        if (allQuestions.length === 0 && isTopFrame && !fromRemoteCmd) {
+            const claimed = await dispatchCommandToChildFrames('single');
+            if (claimed) return;
+        }
+
         const qObj = findSingleQuestionObject(allQuestions);
+
+        // 防御拦截：严禁把没有任何选项/输入框的整页外壳 document.body（如隐藏弹窗、水印）发给 DeepSeek！
+        const isInvalidShellBody = (
+            qObj.blockEl === document.body &&
+            qObj.options.length === 0 &&
+            qObj.inputs.length === 0 &&
+            !isEssayStemHint(qObj.stemText)
+        );
+        if (isInvalidShellBody || !qObj.stemText || qObj.stemText.length < 4) {
+            reportCardHtml(`
+                <div class="ds-answer-box" style="border-left-color:#f59e0b;">
+                    <div class="ds-answer-main" style="color:#f59e0b;">⚠️ 未识别到当前题目</div>
+                    <div class="ds-answer-sub">已自动拦截页面外壳/隐藏弹窗文字，避免浪费额度。请先<b>轻点一下题目正文</b>后再点 🎯（或确认题目是否已加载完毕）。</div>
+                </div>
+            `);
+            return;
+        }
+
         const paperContextSummary = buildFullPaperCrossContext(allQuestions);
 
         if (qObj.blockEl && qObj.blockEl !== document.body) {
@@ -2748,22 +3015,19 @@
         const qIsMath = isMathQuestion(qObj.stemText, qObj.options);
         STATE.lastSingleContext = { qObj, paperContextSummary };
 
-        showCard();
-        if (ui.contentBox) {
-            ui.contentBox.innerHTML = `
-                <div style="display:flex;align-items:center;gap:8px;color:${qIsMath ? '#d8b4fe' : '#38bdf8'};">
-                    <span>${qIsMath ? '📐' : '🔬'}</span>
-                    <span>${qIsMath ? '识别为高数/计算题，正在 R1 深度演算与反向验算...' : '正在 R1 深度推理 + 联网核对与全卷互证...'}</span>
-                </div>
-                <div style="font-size:11.5px;color:#94a3b8;margin-top:4px;">题目：${escapeHtml(qObj.stemText.slice(0, 48))}...</div>
-            `;
-        }
-        if (ui.fab) ui.fab.classList.add('ds-loading');
+        reportCardHtml(`
+            <div style="display:flex;align-items:center;gap:8px;color:${qIsMath ? '#d8b4fe' : '#38bdf8'};">
+                <span>${qIsMath ? '📐' : '🔬'}</span>
+                <span>${qIsMath ? '识别为高数/计算题，正在 R1 深度演算与反向验算...' : '正在 R1 深度推理 + 联网核对与全卷互证...'}</span>
+            </div>
+            <div style="font-size:11.5px;color:#94a3b8;margin-top:4px;">题目：${escapeHtml(qObj.stemText.slice(0, 48))}...</div>
+        `);
+        reportFabState('loading');
         STATE.isAnalyzing = true;
 
         requestSingleQuestionCoTAnalysis(qObj, paperContextSummary, { scene: '单题' }).then((parsed) => {
             STATE.isAnalyzing = false;
-            if (ui.fab) ui.fab.classList.remove('ds-loading');
+            reportFabState('idle');
             renderSingleResult(qObj, parsed, paperContextSummary);
         });
     }
